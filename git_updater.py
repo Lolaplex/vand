@@ -24,7 +24,7 @@ CATALOG_PATH = CONFIG_DIR / "catalog.json"
 LOG_DIR = CONFIG_DIR / "logs"
 SELF_CHECK_CACHE = CONFIG_DIR / "self-check.json"
 SELF_CHECK_TTL_SECS = 24 * 60 * 60
-SELF_GITHUB_DEFAULT = "Cypoe/git-updater"
+SELF_GITHUB_DEFAULT = "Lolaplex/git-updater"
 SKIP_SELF_CHECK_COMMANDS = frozenset({"self-check", "self-update", "init"})
 
 MANIFEST_FILENAMES = (
