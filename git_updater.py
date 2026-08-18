@@ -24,7 +24,6 @@ CATALOG_PATH = CONFIG_DIR / "catalog.json"
 LOG_DIR = CONFIG_DIR / "logs"
 SELF_CHECK_CACHE = CONFIG_DIR / "self-check.json"
 SELF_CHECK_TTL_SECS = 24 * 60 * 60
-SELF_GITHUB_DEFAULT = "Lolaplex/git-updater"
 SKIP_SELF_CHECK_COMMANDS = frozenset({"self-check", "self-update", "init"})
 
 MANIFEST_FILENAMES = (
@@ -160,11 +159,10 @@ def install_root() -> Path:
 
 
 def resolve_self_remote(install_path: Path | None = None) -> str:
+    """Remote id from this checkout's origin. Empty if unknown (no hardcoded upstream)."""
     root = install_path or install_root()
     origin = read_origin(root)
-    if origin:
-        return origin[0]
-    return SELF_GITHUB_DEFAULT
+    return origin[0] if origin else ""
 
 
 @dataclass
@@ -197,7 +195,11 @@ def github_api_json(url: str) -> dict[str, Any] | None:
 
 
 def github_remote_tip(github: str, branch: str | None = None) -> tuple[str, str] | None:
+    if not github or "/" not in github:
+        return None
     owner, repo = github.split("/", 1)
+    if not owner or not repo or "/" in repo:
+        return None
     if not branch:
         meta = github_api_json(f"https://api.github.com/repos/{owner}/{repo}")
         if not meta:
@@ -361,6 +363,8 @@ def check_self(fetch: bool = True, use_cache: bool = True) -> SelfCheckResult:
 
 
 def remote_display_url(remote_id: str) -> str:
+    if not remote_id:
+        return "(no origin)"
     if remote_id.startswith("local:"):
         return remote_id.removeprefix("local:")
     if "/" in remote_id and not remote_id.startswith("local:"):
@@ -653,11 +657,23 @@ def catalog_paths(catalog: Catalog) -> set[str]:
 
 
 def lock_from_catalog(catalog: Catalog) -> dict[str, Any]:
+    """Portable snapshot: relative paths only. Clone root is chosen at replicate time."""
     return {
         "version": LOCK_VERSION,
-        "root": normalize_path(catalog.root),
         "repos": [r.to_dict() for r in catalog.repos],
     }
+
+
+def resolve_lock_root(lock_path: Path, data: dict[str, Any], override: str | None) -> Path:
+    """Pick clone root for this machine. Never reuse another computer's absolute path."""
+    if override:
+        return Path(override).expanduser().resolve()
+    hint = data.get("root")
+    if hint:
+        hinted = Path(str(hint).replace("\\", "/"))
+        if not hinted.is_absolute() and not (len(str(hint)) >= 2 and str(hint)[1] == ":"):
+            return (lock_path.parent / hinted).resolve()
+    return lock_path.parent.resolve()
 
 
 def load_lock(path: Path) -> dict[str, Any]:
@@ -680,7 +696,7 @@ def render_vendor_md(catalog: Catalog, exported_at: str | None = None) -> str:
     lines = [
         "# Vendor log",
         "",
-        f"Clone root: `{normalize_path(catalog.root)}`",
+        "Clone root is chosen at replicate time (`git-updater replicate --root <path>`).",
         f"Exported: {ts}",
         "",
         "| Name | Remote | Branch | Commit | Install |",
@@ -1350,9 +1366,9 @@ def cmd_update(args: argparse.Namespace) -> None:
     log_lines: list[str] = []
     for entry in repos:
         path = repo_abs_path(catalog, entry)
-        print(f"→ {entry.name}")
+        print(f"-> {entry.name}")
         if not path.exists():
-            print(f"  missing — run install")
+            print(f"  missing - run install")
             continue
         if is_dirty(path):
             print(f"  skipped (dirty working tree)")
@@ -1374,10 +1390,10 @@ def cmd_update(args: argparse.Namespace) -> None:
                 )[0]:
                     run_update_hook(entry, path)
         elif behind and ahead:
-            print(f"  diverged (ahead {ahead}, behind {behind}) — manual merge required")
+            print(f"  diverged (ahead {ahead}, behind {behind}) - manual merge required")
             log_lines.append(f"diverged {entry.name}")
         elif behind:
-            print(f"  behind {behind} — could not fast-forward")
+            print(f"  behind {behind} - could not fast-forward")
         else:
             head = current_commit(path)
             if head and head != entry.commit:
@@ -1397,7 +1413,7 @@ def cmd_push(args: argparse.Namespace) -> None:
     log_lines: list[str] = []
     for entry in repos:
         path = repo_abs_path(catalog, entry)
-        print(f"→ {entry.name}")
+        print(f"-> {entry.name}")
         if not path.exists():
             print(f"  missing")
             continue
@@ -1427,14 +1443,14 @@ def cmd_export(args: argparse.Namespace) -> None:
 def cmd_replicate(args: argparse.Namespace) -> None:
     lock_path = Path(args.lockfile)
     data = load_lock(lock_path)
-    root = normalize_path(args.root or data.get("root", "."))
-    root_path = Path(root)
+    root_path = resolve_lock_root(lock_path, data, args.root)
+    print(f"Replicate root: {root_path}")
     log_lines: list[str] = []
 
     for raw in data.get("repos", []):
         entry = RepoEntry.from_dict(raw)
         dest = root_path / entry.path
-        print(f"→ {entry.name}")
+        print(f"-> {entry.name}")
 
         if args.dry_run:
             action = "clone+checkout" if not dest.exists() else "checkout"
@@ -1488,7 +1504,7 @@ def cmd_self_update(args: argparse.Namespace) -> None:
     root = install_root()
     if not (root / ".git").exists():
         raise SystemExit(
-            "git-updater is not a git checkout — clone from GitHub to self-update."
+            "git-updater is not a git checkout - clone from GitHub to self-update."
         )
     result = check_self(fetch=True, use_cache=False)
     print(format_self_check(result))
@@ -1503,7 +1519,7 @@ def cmd_self_update(args: argparse.Namespace) -> None:
     branch = result.branch or current_branch(root) or "main"
     if is_dirty(root):
         raise SystemExit("Refusing to self-update: working tree has local changes.")
-    print(f"→ git pull --ff-only origin {branch}")
+    print(f"-> git pull --ff-only origin {branch}")
     run_git(root, "pull", "--ff-only", "origin", branch)
     new_head = current_commit(root)
     if new_head:
@@ -1516,8 +1532,11 @@ def cmd_verify(args: argparse.Namespace) -> None:
     lock_path = Path(args.lock) if args.lock else Path(catalog.root) / "vendor.lock"
     if lock_path.exists():
         data = load_lock(lock_path)
-        root = Path(args.root or data.get("root", catalog.root))
         entries = [RepoEntry.from_dict(r) for r in data.get("repos", [])]
+    else:
+        entries = catalog.repos
+    if args.root:
+        root = Path(args.root).expanduser().resolve()
     else:
         root = Path(catalog.root)
         entries = catalog.repos
@@ -1556,7 +1575,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("init", help="Create ~/.git-updater/catalog.json")
-    p.add_argument("--root", required=True, help="Clone root directory")
+    p.add_argument(
+        "--root",
+        default=".",
+        help="Clone root directory (default: current directory)",
+    )
     p.add_argument("--force", action="store_true", help="Overwrite existing catalog")
     p.set_defaults(func=cmd_init)
 
@@ -1649,7 +1672,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("replicate", help="Bootstrap stack from vendor.lock")
     p.add_argument("lockfile", help="Path to vendor.lock")
-    p.add_argument("--root", help="Override clone root from lock")
+    p.add_argument(
+        "--root",
+        help="Clone root on this machine (default: directory that contains the lockfile)",
+    )
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_replicate)
 

@@ -16,32 +16,30 @@ Manual CLI only — no background scheduler. For general cron/timer automation, 
 | **[Repo Family](https://github.com/JohnsonArnek/Github-Family)** | Control repo + lock | No personal catalog curation |
 | **git-updater** | Catalog + `vendor.lock` + `replicate` | Small Python stdlib CLI |
 
-Per-app library pins (e.g. [koru-orisha-media/vendor.lock](https://github.com/Cypoe/koru-orisha-media)) pin **trees inside one project**. git-updater pins **whole GitHub repos** across your machine.
+Per-app library pins (a `vendor.lock` *inside* one project) pin trees in that project. git-updater pins **whole repos** across a clone root on your machine.
 
 ## Install
 
 No dependencies beyond Python 3.9+ and Git.
 
 ```powershell
-cd C:\Users\fabi0\repos\git-updater
-# optional: add to PATH
+python git_updater.py --help
+# or, from this directory:
 git-updater.cmd --help
 ```
-
-Or: `python git_updater.py --help`
 
 ## Quick start
 
 ```powershell
-# 1. Create machine catalog
-git-updater init --root C:\Users\fabi0\repos
+# 1. Create machine catalog (clone root = this folder, or pass --root)
+git-updater init --root <clone-root>
 
 # 2. See existing clones not yet tracked
 git-updater scan
 
 # 3. Register an existing folder (reads .git-updater.yaml if present)
-git-updater adopt koru-orisha-media
-git-updater adopt living-software --install "php kernel/init.php"  # manual override
+git-updater adopt <folder>
+git-updater adopt <folder> --install "make install"  # optional override
 
 # 4. Check state
 git-updater status
@@ -49,24 +47,50 @@ git-updater status --fetch
 
 # 5. Export shareable lock + human vendor log
 git-updater export
-# → C:\Users\fabi0\repos\vendor.lock
-# → C:\Users\fabi0\repos\VENDOR.md
+# -> <clone-root>/vendor.lock
+# -> <clone-root>/VENDOR.md
 ```
+
+`<clone-root>` is whatever directory you keep checkouts in. Catalog state lives in `~/.git-updater/` on **this** machine only.
+
+## Shared stack (Lolaplex)
+
+This repo publishes a starter lock for the tools we share. It does **not** pin git-updater itself (the lock lives in this repo).
+
+```powershell
+cd <clone-root>
+git clone https://github.com/Lolaplex/git-updater.git
+python git-updater/git_updater.py init --root .
+python git-updater/git_updater.py adopt git-updater
+python git-updater/git_updater.py replicate git-updater/examples/shared.lock --root .
+python git-updater/git_updater.py adopt agent-memory
+```
+
+Daily sync (pull when the other person pushed):
+
+```powershell
+python git-updater/git_updater.py update agent-memory
+python git-updater/git_updater.py push agent-memory   # after your own commits
+```
+
+`update` fast-forwards a clean tree and re-runs install hooks when the commit changes. Dirty or diverged trees are left alone — `consolidate` if you both edited.
 
 ## On another machine
 
 Copy `vendor.lock` (and optionally `VENDOR.md`), then:
 
 ```powershell
-git-updater replicate C:\path\to\vendor.lock --root D:\repos
+git-updater replicate vendor.lock --root <clone-root>
 ```
+
+If you omit `--root`, clones land next to the lockfile. Absolute `root` values from another computer are ignored.
 
 Clones missing repos, checks out exact SHAs, runs each repo's `install` hook.
 
 Dry run first:
 
 ```powershell
-git-updater replicate vendor.lock --root D:\repos --dry-run
+git-updater replicate vendor.lock --root <clone-root> --dry-run
 ```
 
 ## Daily workflow
@@ -79,7 +103,7 @@ git-updater consolidate --abort NAME      # abort stuck merge/rebase
 git-updater push            # push tracking branches; re-pin HEAD
 git-updater pin             # pin catalog to current HEAD after local commits
 git-updater pin --export    # pin + write vendor.lock
-git-updater verify          # exit 1 if any clone ≠ lock (CI gate)
+git-updater verify          # exit 1 if any clone != lock (CI gate)
 ```
 
 Dirty or diverged repos are **never** force-reset. Use `consolidate` when `update` stops at diverged/ff-only failures, then `pin`.
@@ -88,9 +112,9 @@ Dirty or diverged repos are **never** force-reset. Use `consolidate` when `updat
 
 | Form | Example |
 |------|---------|
-| GitHub shorthand | `Cypoe/living-software` |
+| GitHub shorthand | `owner/repo` |
 | HTTPS / SSH | `https://gitlab.com/group/project.git`, `git@host:org/repo.git` |
-| Local path | `C:\src\my-tool`, `file:///C:/src/my-tool` |
+| Local path | a folder on disk, or `file://` URL |
 
 `adopt` reads whatever `origin` points at. `vendor.lock` stores both `remote` (id) and `url` (clone source). Older locks with only `github` still load.
 
@@ -131,16 +155,16 @@ See [`git-updater.schema.json`](git-updater.schema.json) for the JSON shape.
 
 | File | Purpose |
 |------|---------|
-| `~/.git-updater/catalog.json` | Your curated repo list (private to this machine) |
+| `~/.git-updater/catalog.json` | Your curated repo list (private to this machine, includes local clone root) |
 | `~/.git-updater/logs/` | Timestamped logs from update/install/replicate |
-| `<root>/vendor.lock` | Shareable pin snapshot (export from catalog) |
-| `<root>/VENDOR.md` | Human-readable vendor table |
+| `<clone-root>/vendor.lock` | Shareable pin snapshot (relative paths only; no machine root) |
+| `<clone-root>/VENDOR.md` | Human-readable vendor table |
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `init --root PATH` | Create catalog |
+| `init [--root PATH]` | Create catalog (default root: current directory) |
 | `scan` | Git folders under root not in catalog |
 | `add owner/repo [--install CMD]` | Clone + register |
 | `adopt FOLDER [--install CMD]` | Register existing clone (auto-reads manifest) |
@@ -164,17 +188,18 @@ Global: `--no-self-check` skips the automatic post-command update hint.
 
 ## vendor.lock format (v1)
 
+Portable. No absolute paths. `path` is relative to the clone root you pass to `replicate`.
+
 ```json
 {
   "version": 1,
-  "root": "C:/Users/fabi0/repos",
   "repos": [
     {
-      "name": "koru-orisha-media",
-      "remote": "Cypoe/koru-orisha-media",
-      "github": "Cypoe/koru-orisha-media",
-      "url": "https://github.com/Cypoe/koru-orisha-media.git",
-      "path": "koru-orisha-media",
+      "name": "example-app",
+      "remote": "acme/example-app",
+      "github": "acme/example-app",
+      "url": "https://github.com/acme/example-app.git",
+      "path": "example-app",
       "branch": "main",
       "commit": "b6dfd52…",
       "install": "npm ci && npm run build",
@@ -193,7 +218,7 @@ Example future job:
 ```yaml
 - name: sync-repos
   command: git-updater update && git-updater export
-  cwd: C:/Users/fabi0/repos/git-updater
+  cwd: /path/to/git-updater
   schedule: "0 9 * * *"
 ```
 
@@ -205,7 +230,7 @@ python -m unittest discover -s tests -v
 
 ## Self-update check
 
-git-updater checks whether **itself** is behind upstream:
+git-updater checks whether **itself** is behind **this checkout's `origin`**:
 
 ```powershell
 git-updater self-check              # uses 24h cache when offline-friendly
@@ -217,8 +242,9 @@ After most commands, a one-line note appears if an update is available (disable 
 
 Detection order:
 
-1. If `git_updater.py` lives in a git clone → compare `HEAD` to `origin/<branch>`
-2. Otherwise → GitHub API against `Cypoe/git-updater` (or `origin` URL when present)
+1. If `git_updater.py` lives in a git clone: compare `HEAD` to `origin/<branch>`
+2. Else if `origin` is a GitHub `owner/repo` URL: GitHub API
+3. Otherwise: unknown (no hardcoded upstream)
 
 ## License
 

@@ -16,14 +16,14 @@ import git_updater as gu
 
 class ParseRepoSpecTests(unittest.TestCase):
     def test_owner_repo(self) -> None:
-        name, slug, url = gu.parse_repo_spec("Cypoe/living-software")
-        self.assertEqual(name, "living-software")
-        self.assertEqual(slug, "Cypoe/living-software")
-        self.assertEqual(url, "https://github.com/Cypoe/living-software.git")
+        name, slug, url = gu.parse_repo_spec("acme/example-app")
+        self.assertEqual(name, "example-app")
+        self.assertEqual(slug, "acme/example-app")
+        self.assertEqual(url, "https://github.com/acme/example-app.git")
 
     def test_https_url(self) -> None:
-        _, slug, url = gu.parse_repo_spec("https://github.com/eaxum/clustta-client.git")
-        self.assertEqual(slug, "eaxum/clustta-client")
+        _, slug, url = gu.parse_repo_spec("https://github.com/acme/example-client.git")
+        self.assertEqual(slug, "acme/example-client")
         self.assertIn("github.com", url)
 
     def test_gitlab_url(self) -> None:
@@ -38,8 +38,8 @@ class ParseRepoSpecTests(unittest.TestCase):
             self.assertEqual(url, Path(tmp).resolve().as_posix())
 
     def test_ssh_url(self) -> None:
-        parsed = gu.parse_github_remote("git@github.com:Cypoe/isa-physics.git")
-        self.assertEqual(parsed, ("Cypoe", "isa-physics"))
+        parsed = gu.parse_github_remote("git@github.com:acme/example-app.git")
+        self.assertEqual(parsed, ("acme", "example-app"))
         rid = gu.remote_id_from_url("git@gitlab.com:group/project.git")
         self.assertEqual(rid, "gitlab.com/group/project")
 
@@ -67,6 +67,7 @@ class LockRoundTripTests(unittest.TestCase):
         )
         lock = gu.lock_from_catalog(catalog)
         self.assertEqual(lock["version"], 1)
+        self.assertNotIn("root", lock)
         self.assertEqual(len(lock["repos"]), 1)
         self.assertEqual(lock["repos"][0]["github"], "acme/demo")
         entry = gu.RepoEntry.from_dict(lock["repos"][0])
@@ -74,6 +75,20 @@ class LockRoundTripTests(unittest.TestCase):
         self.assertEqual(entry.remote, "acme/demo")
         self.assertEqual(entry.commit, "abc123def456")
         self.assertEqual(entry.install, "echo hi")
+
+    def test_resolve_lock_root_ignores_foreign_absolute(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "vendor.lock"
+            lock_path.write_text("{}", encoding="utf-8")
+            foreign = "C:/definitely/not/on/this/machine/repos"
+            data = {"version": 1, "root": foreign}
+            resolved = gu.resolve_lock_root(lock_path, data, None)
+            self.assertEqual(resolved, lock_path.parent.resolve())
+
+            override = Path(tmp) / "elsewhere"
+            override.mkdir()
+            resolved_override = gu.resolve_lock_root(lock_path, data, str(override))
+            self.assertEqual(resolved_override, override.resolve())
 
     def test_save_and_load_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -282,6 +297,8 @@ class VendorMdTests(unittest.TestCase):
         self.assertIn("| app |", md)
         self.assertIn("1234567", md)
         self.assertIn("me/app", md)
+        self.assertNotIn("/repos", md)
+        self.assertIn("replicate --root", md)
 
 
 class SelfCheckTests(unittest.TestCase):
