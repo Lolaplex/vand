@@ -50,6 +50,7 @@ class RepoEntry:
     commit: str
     install: str | None = None
     update: str | None = None
+    mirrors: list[str] = field(default_factory=list)
 
     @property
     def github(self) -> str:
@@ -70,11 +71,16 @@ class RepoEntry:
             d["install"] = self.install
         if self.update is not None:
             d["update"] = self.update
+        if self.mirrors:
+            d["mirrors"] = list(self.mirrors)
         return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RepoEntry:
         remote = data.get("remote") or data.get("github") or data.get("url", "?")
+        mirrors = data.get("mirrors") or []
+        if isinstance(mirrors, str):
+            mirrors = [mirrors]
         return cls(
             name=data["name"],
             remote=remote,
@@ -84,6 +90,7 @@ class RepoEntry:
             commit=data["commit"],
             install=data.get("install"),
             update=data.get("update"),
+            mirrors=[str(item) for item in mirrors if str(item).strip()],
         )
 
 
@@ -544,6 +551,232 @@ def read_origin(entry_path: Path) -> tuple[str, str] | None:
     return remote_id_from_url(url), url
 
 
+def github_owner_repo(remote_id: str, url: str | None = None) -> tuple[str, str] | None:
+    """Lowercase (owner, repo) for GitHub remotes; None otherwise."""
+    if url:
+        parsed = parse_github_remote(url)
+        if parsed:
+            return parsed[0].lower(), parsed[1].lower()
+    parsed = parse_github_remote(remote_id)
+    if parsed:
+        return parsed[0].lower(), parsed[1].lower()
+    if (
+        remote_id.count("/") == 1
+        and not remote_id.startswith("local:")
+        and "://" not in remote_id
+        and not remote_id.startswith("git@")
+    ):
+        owner, repo = remote_id.split("/", 1)
+        if "." not in owner:
+            return owner.lower(), repo.removesuffix(".git").lower()
+    return None
+
+
+def same_github_project(
+    remote_a: str,
+    remote_b: str,
+    url_a: str | None = None,
+    url_b: str | None = None,
+) -> bool:
+    """Same clone, or GitHub remotes that share a repo name (owner ignored)."""
+    id_a = remote_id_from_url(url_a or remote_a).lower()
+    id_b = remote_id_from_url(url_b or remote_b).lower()
+    if id_a == id_b:
+        return True
+    parts_a = github_owner_repo(remote_a, url_a)
+    parts_b = github_owner_repo(remote_b, url_b)
+    if parts_a and parts_b:
+        return parts_a[1] == parts_b[1]
+    return False
+
+
+def list_remotes(path: Path) -> list[tuple[str, str, str]]:
+    """Return [(name, url, remote_id), ...] for fetch remotes."""
+    try:
+        result = run_git(path, "remote", "-v")
+    except subprocess.CalledProcessError:
+        return []
+    found: dict[str, tuple[str, str, str]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        if len(parts) >= 3 and parts[-1] != "(fetch)":
+            continue
+        name = parts[0]
+        url = normalize_clone_url(parts[1])
+        found[name] = (name, url, remote_id_from_url(url))
+    return list(found.values())
+
+
+def urls_equivalent(url_a: str, url_b: str) -> bool:
+    left = normalize_clone_url(url_a).rstrip("/").lower()
+    right = normalize_clone_url(url_b).rstrip("/").lower()
+    if left == right:
+        return True
+    return remote_id_from_url(url_a).lower() == remote_id_from_url(url_b).lower()
+
+
+def suggested_remote_name(url: str) -> str:
+    parts = github_owner_repo(remote_id_from_url(url), url)
+    if parts:
+        return parts[0]
+    return "git-updater"
+
+
+def ensure_remote(path: Path, url: str) -> str | None:
+    """Add url as a named remote if missing. Name = GitHub owner (e.g. lolaplex)."""
+    url = normalize_clone_url(url)
+    if not url:
+        return None
+    remotes = list_remotes(path)
+    for name, existing, _rid in remotes:
+        if urls_equivalent(existing, url):
+            return name
+    name = suggested_remote_name(url)
+    taken = {existing_name for existing_name, _, _ in remotes}
+    if name in taken:
+        suffix = 2
+        while f"{name}-{suffix}" in taken:
+            suffix += 1
+        name = f"{name}-{suffix}"
+    try:
+        run_git(path, "remote", "add", name, url)
+    except subprocess.CalledProcessError:
+        return None
+    print(f"  remote + {name} -> {url}")
+    return name
+
+
+def entry_fetch_urls(entry: RepoEntry) -> list[str]:
+    urls: list[str] = []
+    for candidate in [entry.url, *entry.mirrors]:
+        if candidate and not any(urls_equivalent(candidate, existing) for existing in urls):
+            urls.append(candidate)
+    return urls
+
+
+def attach_entry_remotes(path: Path, entry: RepoEntry) -> None:
+    for url in entry_fetch_urls(entry):
+        ensure_remote(path, url)
+
+
+def mirrors_from_clone(path: Path, origin_id: str, origin_url: str) -> list[str]:
+    mirrors: list[str] = []
+    for _name, url, rid in list_remotes(path):
+        if urls_equivalent(url, origin_url):
+            continue
+        if same_github_project(origin_id, rid, origin_url, url):
+            mirrors.append(url)
+    return mirrors
+
+
+def commit_exists(path: Path, commit: str) -> bool:
+    result = run_git(path, "cat-file", "-e", f"{commit}^{{commit}}", check=False)
+    return result.returncode == 0
+
+
+def same_project_remote_names(path: Path, entry: RepoEntry) -> list[str]:
+    extra = entry_fetch_urls(entry)
+    names: list[str] = []
+    remotes = list_remotes(path)
+    for name, url, rid in remotes:
+        if same_github_project(entry.remote, rid, entry.url, url):
+            names.append(name)
+            continue
+        if any(same_github_project(entry.remote, rid, extra_url, url) for extra_url in extra):
+            names.append(name)
+    if names:
+        return names
+    existing = [name for name, _, _ in remotes]
+    if "origin" in existing:
+        return ["origin"]
+    return existing[:1]
+
+
+def fetch_all_remotes(path: Path, extra_urls: list[str] | None = None) -> None:
+    for url in extra_urls or []:
+        ensure_remote(path, url)
+    for name, _url, _rid in list_remotes(path):
+        run_git(path, "fetch", name, check=False)
+
+
+def fetch_commit(path: Path, commit: str, extra_urls: list[str] | None = None) -> None:
+    if commit_exists(path, commit):
+        return
+    remotes = list_remotes(path)
+    names = [name for name, _, _ in remotes]
+    if "origin" in names:
+        names = ["origin"] + [name for name in names if name != "origin"]
+    for name in names:
+        run_git(path, "fetch", name, commit, check=False)
+        if commit_exists(path, commit):
+            return
+        run_git(path, "fetch", name, check=False)
+        if commit_exists(path, commit):
+            return
+    for url in extra_urls or []:
+        ensure_remote(path, url)
+        run_git(path, "fetch", url, commit, check=False)
+        if commit_exists(path, commit):
+            return
+        run_git(path, "fetch", url, check=False)
+        if commit_exists(path, commit):
+            return
+
+
+def remote_ahead_behind(path: Path, branch: str, remote: str) -> tuple[int, int]:
+    try:
+        result = run_git(
+            path,
+            "rev-list",
+            "--left-right",
+            "--count",
+            f"HEAD...{remote}/{branch}",
+        )
+    except subprocess.CalledProcessError:
+        return 0, 0
+    parts = result.stdout.strip().split()
+    if len(parts) != 2:
+        return 0, 0
+    return int(parts[0]), int(parts[1])
+
+
+def pick_sync_ref(path: Path, branch: str, remote_names: list[str]) -> tuple[str | None, str]:
+    """Pick a fast-forward ref across same-project remotes.
+
+    origin diverged → stop. Else prefer the farthest ff-able remote (e.g. org
+    mirror ahead of personal origin). kind: current | behind | diverged.
+    """
+    if "origin" in remote_names:
+        ahead, behind = remote_ahead_behind(path, branch, "origin")
+        if ahead and behind:
+            return None, "diverged"
+    ff_refs: list[tuple[int, str]] = []
+    any_diverged = False
+    for remote in remote_names:
+        ahead, behind = remote_ahead_behind(path, branch, remote)
+        if ahead and behind:
+            any_diverged = True
+            continue
+        if behind:
+            ff_refs.append((behind, f"{remote}/{branch}"))
+    if ff_refs:
+        ff_refs.sort(key=lambda item: item[0], reverse=True)
+        return ff_refs[0][1], "behind"
+    if any_diverged:
+        return None, "diverged"
+    return None, "current"
+
+
+def default_sync_ref(branch: str, remote_names: list[str]) -> str:
+    if "origin" in remote_names:
+        return f"origin/{branch}"
+    if remote_names:
+        return f"{remote_names[0]}/{branch}"
+    return f"origin/{branch}"
+
+
 def current_branch(path: Path) -> str | None:
     try:
         result = run_git(path, "rev-parse", "--abbrev-ref", "HEAD")
@@ -570,22 +803,8 @@ def is_dirty(path: Path) -> bool:
 
 
 def ahead_behind(path: Path, branch: str) -> tuple[int, int]:
-    try:
-        run_git(path, "fetch", "origin", branch, check=False)
-        result = run_git(
-            path,
-            "rev-list",
-            "--left-right",
-            "--count",
-            f"HEAD...origin/{branch}",
-        )
-    except subprocess.CalledProcessError:
-        return 0, 0
-    parts = result.stdout.strip().split()
-    if len(parts) != 2:
-        return 0, 0
-    ahead, behind = int(parts[0]), int(parts[1])
-    return ahead, behind
+    run_git(path, "fetch", "origin", branch, check=False)
+    return remote_ahead_behind(path, branch, "origin")
 
 
 def classify_repo(catalog: Catalog, entry: RepoEntry, fetch: bool = False) -> str:
@@ -597,28 +816,26 @@ def classify_repo(catalog: Catalog, entry: RepoEntry, fetch: bool = False) -> st
     head = current_commit(path)
     if not head:
         return "missing"
-    if head != entry.commit:
-        branch = current_branch(path) or entry.branch
-        if fetch:
-            ahead, behind = ahead_behind(path, branch)
-        else:
-            ahead, behind = 0, 0
-        if ahead and behind:
-            return "diverged"
-        if ahead:
-            return "ahead"
-        if behind:
-            return "behind"
-        return "unpinned"
-    branch = current_branch(path) or entry.branch
     if fetch:
-        ahead, behind = ahead_behind(path, branch)
-        if ahead and behind:
+        fetch_all_remotes(path, entry_fetch_urls(entry))
+    names = same_project_remote_names(path, entry)
+    branch = current_branch(path) or entry.branch
+    _ref, sync = pick_sync_ref(path, branch, names)
+    origin_ahead, _origin_behind = remote_ahead_behind(path, branch, "origin")
+    if head != entry.commit:
+        if sync == "diverged":
             return "diverged"
-        if ahead:
-            return "ahead"
-        if behind:
+        if sync == "behind":
             return "behind"
+        if origin_ahead:
+            return "ahead"
+        return "unpinned"
+    if sync == "diverged":
+        return "diverged"
+    if sync == "behind":
+        return "behind"
+    if origin_ahead:
+        return "ahead"
     return "pinned"
 
 
@@ -966,9 +1183,24 @@ def clone_repo(url: str, dest: Path, branch: str) -> None:
             raise
 
 
-def checkout_pin(path: Path, commit: str) -> None:
-    run_git(path, "fetch", "origin", commit, check=False)
-    run_git(path, "checkout", "--detach", commit)
+def checkout_pin(
+    path: Path,
+    commit: str,
+    extra_urls: list[str] | None = None,
+) -> None:
+    if not commit_exists(path, commit):
+        fetch_commit(path, commit, extra_urls)
+    if not commit_exists(path, commit):
+        raise SystemExit(
+            f"Commit {commit[:7]} not found in {path}. "
+            "Tried every git remote plus lock/catalog URLs. "
+            "Same GitHub repo name under a different owner is treated as the "
+            "same project — add that remote or check the lock SHA."
+        )
+    try:
+        run_git(path, "checkout", "--detach", commit)
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"checkout --detach {commit[:7]} failed in {path}") from exc
 
 
 def can_use_github_api(remote_id: str, url: str | None = None) -> bool:
@@ -1057,24 +1289,30 @@ def consolidate_repo(
         return "skipped", [f"skip dirty {entry.name}"]
 
     branch = current_branch(path) or entry.branch
-    run_git(path, "fetch", "origin", check=False)
-    ahead, behind = ahead_behind(path, branch)
+    attach_entry_remotes(path, entry)
+    fetch_all_remotes(path, entry_fetch_urls(entry))
+    names = same_project_remote_names(path, entry)
+    ref, sync = pick_sync_ref(path, branch, names)
+    merge_ref = ref or default_sync_ref(branch, names)
     old_commit = entry.commit
 
-    if not behind:
+    if sync != "behind":
         head = current_commit(path)
         if head and head != entry.commit:
             entry.commit = head
-        print(f"  up to date")
-        return "ok", []
+        if sync == "diverged":
+            print(f"  diverged - trying {strategy} onto {merge_ref}")
+        else:
+            print(f"  up to date")
+            return "ok", []
 
-    if behind and not ahead:
+    if sync == "behind" and ref:
         try:
-            run_git(path, "merge", "--ff-only", f"origin/{branch}")
+            run_git(path, "merge", "--ff-only", ref)
             new_commit = current_commit(path)
             if new_commit:
                 entry.commit = new_commit
-                print(f"  fast-forward {old_commit[:7]} -> {new_commit[:7]}")
+                print(f"  fast-forward {old_commit[:7]} -> {new_commit[:7]} ({ref})")
                 if new_commit and new_commit != old_commit and resolve_hook_command(
                     entry, path, "update"
                 )[0]:
@@ -1085,9 +1323,9 @@ def consolidate_repo(
 
     try:
         if strategy == "rebase":
-            run_git(path, "rebase", f"origin/{branch}")
+            run_git(path, "rebase", merge_ref)
         else:
-            run_git(path, "merge", f"origin/{branch}")
+            run_git(path, "merge", merge_ref)
     except subprocess.CalledProcessError:
         conflicts = list_conflicts(path)
         print(f"  conflict ({len(conflicts)} file(s))")
@@ -1165,9 +1403,14 @@ def cmd_scan(args: argparse.Namespace) -> None:
         rel = path.relative_to(root) if path.is_relative_to(root) else path
         origin = read_origin(path)
         slug = origin[0] if origin else "?"
+        extra = ""
+        if origin:
+            aliases = mirrors_from_clone(path, origin[0], origin[1])
+            if aliases:
+                extra = " (+" + ", ".join(remote_id_from_url(url) for url in aliases) + ")"
         manifest = discover_repo_hooks(path)
         hook = f" [{manifest.source}]" if manifest else ""
-        print(f"  {rel}\t{slug}{hook}")
+        print(f"  {rel}\t{slug}{extra}{hook}")
 
 
 def cmd_add(args: argparse.Namespace) -> None:
@@ -1224,10 +1467,15 @@ def cmd_adopt(args: argparse.Namespace) -> None:
         raise SystemExit(f"Path must be under clone root {root}")
 
     origin = read_origin(path)
+    remotes = list_remotes(path)
     if not origin:
-        raise SystemExit(f"Not a git repo with an origin remote: {path}")
+        if remotes:
+            origin = (remotes[0][2], remotes[0][1])
+        else:
+            raise SystemExit(f"Not a git repo with remotes: {path}")
 
     remote_id, url = origin
+    mirrors = mirrors_from_clone(path, remote_id, url)
     rel = path.relative_to(root).as_posix()
     name = args.name or unique_name(catalog, path.name)
     branch = current_branch(path) or args.branch or "main"
@@ -1245,6 +1493,7 @@ def cmd_adopt(args: argparse.Namespace) -> None:
         path=rel,
         branch=branch,
         commit=commit,
+        mirrors=mirrors,
     )
     if args.install:
         entry.install = args.install
@@ -1256,6 +1505,8 @@ def cmd_adopt(args: argparse.Namespace) -> None:
     catalog.repos.append(entry)
     save_catalog(catalog)
     print(f"Adopted {name} @ {commit[:7]} ({remote_id})")
+    if mirrors:
+        print("  same project: " + ", ".join(remote_id_from_url(m) for m in mirrors))
 
 
 def cmd_sync_hooks(args: argparse.Namespace) -> None:
@@ -1345,12 +1596,13 @@ def cmd_install(args: argparse.Namespace) -> None:
         path = repo_abs_path(catalog, entry)
         if not path.exists() or not (path / ".git").exists():
             clone_repo(entry.url, path, entry.branch)
-            checkout_pin(path, entry.commit)
+            checkout_pin(path, entry.commit, entry_fetch_urls(entry))
             log_lines.append(f"cloned {entry.name}")
         else:
+            attach_entry_remotes(path, entry)
             head = current_commit(path)
             if head != entry.commit:
-                checkout_pin(path, entry.commit)
+                checkout_pin(path, entry.commit, entry_fetch_urls(entry))
                 log_lines.append(f"checked out {entry.name} @ {entry.commit[:7]}")
         if resolve_hook_command(entry, path, "install")[0]:
             run_install(entry, path)
@@ -1375,25 +1627,25 @@ def cmd_update(args: argparse.Namespace) -> None:
             log_lines.append(f"skip dirty {entry.name}")
             continue
         branch = current_branch(path) or entry.branch
-        run_git(path, "fetch", "origin", check=False)
-        ahead, behind = ahead_behind(path, branch)
+        attach_entry_remotes(path, entry)
+        fetch_all_remotes(path, entry_fetch_urls(entry))
+        names = same_project_remote_names(path, entry)
+        ref, sync = pick_sync_ref(path, branch, names)
         old_commit = entry.commit
-        if behind and not ahead:
-            run_git(path, "merge", "--ff-only", f"origin/{branch}")
+        if sync == "behind" and ref:
+            run_git(path, "merge", "--ff-only", ref)
             new_commit = current_commit(path)
             if new_commit:
                 entry.commit = new_commit
-                print(f"  fast-forward {old_commit[:7]} -> {new_commit[:7]}")
+                print(f"  fast-forward {old_commit[:7]} -> {new_commit[:7]} ({ref})")
                 log_lines.append(f"updated {entry.name} {old_commit[:7]}->{new_commit[:7]}")
                 if new_commit and new_commit != old_commit and resolve_hook_command(
                     entry, path, "update"
                 )[0]:
                     run_update_hook(entry, path)
-        elif behind and ahead:
-            print(f"  diverged (ahead {ahead}, behind {behind}) - manual merge required")
+        elif sync == "diverged":
+            print(f"  diverged - manual merge required (consolidate)")
             log_lines.append(f"diverged {entry.name}")
-        elif behind:
-            print(f"  behind {behind} - could not fast-forward")
         else:
             head = current_commit(path)
             if head and head != entry.commit:
@@ -1465,12 +1717,13 @@ def cmd_replicate(args: argparse.Namespace) -> None:
 
         if not dest.exists():
             clone_repo(entry.url, dest, entry.branch)
-            checkout_pin(dest, entry.commit)
+            checkout_pin(dest, entry.commit, entry_fetch_urls(entry))
             log_lines.append(f"cloned {entry.name}")
         else:
+            attach_entry_remotes(dest, entry)
             head = current_commit(dest)
             if head != entry.commit:
-                checkout_pin(dest, entry.commit)
+                checkout_pin(dest, entry.commit, entry_fetch_urls(entry))
                 log_lines.append(f"checked out {entry.name} @ {entry.commit[:7]}")
             else:
                 print(f"  already at {entry.commit[:7]}")

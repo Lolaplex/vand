@@ -75,6 +75,47 @@ class LockRoundTripTests(unittest.TestCase):
         self.assertEqual(entry.remote, "acme/demo")
         self.assertEqual(entry.commit, "abc123def456")
         self.assertEqual(entry.install, "echo hi")
+        self.assertEqual(entry.mirrors, [])
+
+    def test_mirrors_roundtrip(self) -> None:
+        catalog = gu.Catalog(
+            version=1,
+            root="/repos",
+            repos=[
+                gu.RepoEntry(
+                    name="demo",
+                    remote="me/demo",
+                    url="https://github.com/me/demo.git",
+                    path="demo",
+                    branch="main",
+                    commit="abc123",
+                    mirrors=["https://github.com/acme/demo.git"],
+                )
+            ],
+        )
+        lock = gu.lock_from_catalog(catalog)
+        self.assertEqual(
+            lock["repos"][0]["mirrors"],
+            ["https://github.com/acme/demo.git"],
+        )
+        entry = gu.RepoEntry.from_dict(lock["repos"][0])
+        self.assertEqual(entry.mirrors, ["https://github.com/acme/demo.git"])
+
+    def test_mirrors_round_trip(self) -> None:
+        entry = gu.RepoEntry(
+            name="agent-memory",
+            remote="Klix927/agent-memory",
+            url="https://github.com/Klix927/agent-memory.git",
+            path="agent-memory",
+            branch="main",
+            commit="abc",
+            mirrors=["https://github.com/Lolaplex/agent-memory.git"],
+        )
+        loaded = gu.RepoEntry.from_dict(entry.to_dict())
+        self.assertEqual(
+            loaded.mirrors,
+            ["https://github.com/Lolaplex/agent-memory.git"],
+        )
 
     def test_resolve_lock_root_ignores_foreign_absolute(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -130,7 +171,9 @@ class StatusClassificationTests(unittest.TestCase):
     @mock.patch("git_updater.is_dirty", return_value=False)
     @mock.patch("git_updater.current_commit", return_value="a" * 40)
     @mock.patch("git_updater.current_branch", return_value="main")
-    @mock.patch("git_updater.ahead_behind", return_value=(0, 0))
+    @mock.patch("git_updater.same_project_remote_names", return_value=["origin"])
+    @mock.patch("git_updater.pick_sync_ref", return_value=(None, "current"))
+    @mock.patch("git_updater.remote_ahead_behind", return_value=(0, 0))
     def test_pinned(self, *_m: mock.Mock) -> None:
         with mock.patch("pathlib.Path.exists", return_value=True):
             with mock.patch("pathlib.Path.__truediv__", return_value=mock.Mock(exists=lambda: True)):
@@ -185,7 +228,10 @@ class ReplicateDryRunTests(unittest.TestCase):
 class ConsolidateTests(unittest.TestCase):
     @mock.patch("git_updater.run_install")
     @mock.patch("git_updater.run_git")
-    @mock.patch("git_updater.ahead_behind", return_value=(1, 2))
+    @mock.patch("git_updater.attach_entry_remotes")
+    @mock.patch("git_updater.fetch_all_remotes")
+    @mock.patch("git_updater.same_project_remote_names", return_value=["origin"])
+    @mock.patch("git_updater.pick_sync_ref", return_value=(None, "diverged"))
     @mock.patch("git_updater.is_dirty", return_value=False)
     @mock.patch("git_updater.current_branch", return_value="main")
     @mock.patch("git_updater.current_commit", return_value="c" * 40)
@@ -360,6 +406,96 @@ class SelfCheckTests(unittest.TestCase):
     def test_maybe_warn_respects_skip_env(self, mock_check: mock.Mock) -> None:
         gu.maybe_warn_self_update()
         mock_check.assert_not_called()
+
+
+class GithubProjectIdentityTests(unittest.TestCase):
+    def test_same_repo_name_different_owner(self) -> None:
+        self.assertTrue(
+            gu.same_github_project(
+                "Klix927/agent-memory",
+                "lolaplex/agent-memory",
+                "https://github.com/Klix927/agent-memory.git",
+                "https://github.com/Lolaplex/agent-memory.git",
+            )
+        )
+
+    def test_different_repo_name(self) -> None:
+        self.assertFalse(
+            gu.same_github_project("me/foo", "org/bar")
+        )
+
+    def test_gitlab_keeps_full_path(self) -> None:
+        self.assertFalse(
+            gu.same_github_project(
+                "gitlab.com/group/project",
+                "gitlab.com/other/project",
+                "https://gitlab.com/group/project.git",
+                "https://gitlab.com/other/project.git",
+            )
+        )
+
+    def test_github_owner_repo_from_id(self) -> None:
+        self.assertEqual(
+            gu.github_owner_repo("Lolaplex/agent-memory"),
+            ("lolaplex", "agent-memory"),
+        )
+
+    def test_suggested_remote_name_uses_owner(self) -> None:
+        self.assertEqual(
+            gu.suggested_remote_name("https://github.com/Lolaplex/agent-memory.git"),
+            "lolaplex",
+        )
+
+
+class SyncRefTests(unittest.TestCase):
+    def test_ff_org_mirror_when_origin_current(self) -> None:
+        def fake_ahead(_path: Path, _branch: str, remote: str) -> tuple[int, int]:
+            if remote == "origin":
+                return (0, 0)
+            if remote == "lolaplex":
+                return (0, 1)
+            return (0, 0)
+
+        with mock.patch("git_updater.remote_ahead_behind", side_effect=fake_ahead):
+            ref, kind = gu.pick_sync_ref(Path("/tmp/r"), "main", ["origin", "lolaplex"])
+        self.assertEqual(kind, "behind")
+        self.assertEqual(ref, "lolaplex/main")
+
+    def test_origin_diverged_wins(self) -> None:
+        def fake_ahead(_path: Path, _branch: str, remote: str) -> tuple[int, int]:
+            if remote == "origin":
+                return (1, 1)
+            return (0, 3)
+
+        with mock.patch("git_updater.remote_ahead_behind", side_effect=fake_ahead):
+            ref, kind = gu.pick_sync_ref(Path("/tmp/r"), "main", ["origin", "lolaplex"])
+        self.assertEqual(kind, "diverged")
+        self.assertIsNone(ref)
+
+
+class CheckoutPinTests(unittest.TestCase):
+    @mock.patch("git_updater.run_git")
+    @mock.patch("git_updater.fetch_commit")
+    @mock.patch("git_updater.commit_exists", side_effect=[False, True])
+    def test_fetches_then_checkouts(
+        self,
+        _exists: mock.Mock,
+        mock_fetch: mock.Mock,
+        mock_run: mock.Mock,
+    ) -> None:
+        dest = Path("/tmp/agent-memory")
+        urls = ["https://github.com/Lolaplex/agent-memory.git"]
+        gu.checkout_pin(dest, "a" * 40, extra_urls=urls)
+        mock_fetch.assert_called_once_with(dest, "a" * 40, urls)
+        mock_run.assert_called_once_with(dest, "checkout", "--detach", "a" * 40)
+
+    @mock.patch("git_updater.fetch_commit")
+    @mock.patch("git_updater.commit_exists", return_value=False)
+    def test_errors_when_commit_missing(self, _exists: mock.Mock, mock_fetch: mock.Mock) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            gu.checkout_pin(Path("/tmp/r"), "deadbeef")
+        self.assertIn("not found", str(raised.exception))
+        mock_fetch.assert_called_once()
 
 
 if __name__ == "__main__":

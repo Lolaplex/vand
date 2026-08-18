@@ -120,7 +120,9 @@ Dirty or diverged repos are **never** force-reset. Use `consolidate` when `updat
 | HTTPS / SSH | `https://gitlab.com/group/project.git`, `git@host:org/repo.git` |
 | Local path | a folder on disk, or `file://` URL |
 
-`adopt` reads whatever `origin` points at. `vendor.lock` stores both `remote` (id) and `url` (clone source). Older locks with only `github` still load.
+`adopt` reads `origin` (push target). Extra remotes with the **same GitHub repo name** (owner ignored) are stored as `mirrors`. `vendor.lock` stores `remote` (id), `url` (clone source), and optional `mirrors`. Older locks with only `github` still load.
+
+**Personal origin + org copy:** `Klix927/agent-memory` and `Lolaplex/agent-memory` are the same project. `replicate` / `update` / `install` fetch every matching remote and add the lock URL as a named remote (GitHub owner, e.g. `lolaplex`) if missing. `push` still uses `origin`.
 
 ## For repo authors — `.git-updater.yaml`
 
@@ -207,7 +209,8 @@ Portable. No absolute paths. `path` is relative to the clone root you pass to `r
       "branch": "main",
       "commit": "b6dfd52…",
       "install": "npm ci && npm run build",
-      "update": "npm ci"
+      "update": "npm ci",
+      "mirrors": ["https://github.com/you/example-app.git"]
     }
   ]
 }
