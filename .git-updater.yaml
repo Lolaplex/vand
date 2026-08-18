@@ -1,5 +1,9 @@
 # Machine-readable hooks for git-updater.
 version: 1
-install: python -m pip install -e .
-update: python -m pip install -e .
+install:
+  - python -m pip install -e .
+  - python git_updater.py install-skills
+update:
+  - python -m pip install -e .
+  - python git_updater.py install-skills
 verify: python -m unittest discover -s tests -v

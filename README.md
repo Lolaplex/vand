@@ -24,17 +24,41 @@ Python 3.9+, Git, and pip. From a clone:
 
 ```powershell
 python -m pip install -e .
-git-updater --help
+git-updater init --root <clone-root>
+```
+
+Or from a fresh clone, skip the separate pip — `init` runs `pip install -e` itself:
+
+```powershell
+python git_updater.py init --root <clone-root>
 ```
 
 That puts `git-updater` on PATH (Windows: the Python `Scripts` folder). Editable (`-e`) keeps the command pointed at this checkout, so `self-update` / `git pull` still work.
 
 Without installing, you can still run `python git_updater.py` or `git-updater.cmd` from this directory.
 
+**Coding agents:** follow [`AGENTS.md`](AGENTS.md). That file is the install spec. This README is the map. First-run is `python git_updater.py init --root <clone-root>` (catalog, pip -e, skills, adopt self, shared.lock). Usage skill: [`skills/git-updater/SKILL.md`](skills/git-updater/SKILL.md).
+
+## Help that machines can read
+
+Human `--help` is a wall of text. Agents and other tools should not scrape it.
+
+```powershell
+git-updater --help              # people
+git-updater --help-json         # full spec: commands, flags, args, defaults
+git-updater --help-json replicate
+git-updater help --json
+git-updater help replicate --json
+git-updater man                 # roff man page on stdout (also: man/git-updater.1)
+git-updater man --write man/git-updater.1
+```
+
+`--help-json` is generated from argparse, so it cannot drift from the real CLI. On Unix: `git-updater man | groff -man -Tutf8 | less` or install `man/git-updater.1` on `MANPATH`.
+
 ## Quick start
 
 ```powershell
-# 1. Create machine catalog (clone root = this folder, or pass --root)
+# 1. First-run (catalog + PATH + skills + adopt this clone + shared.lock)
 git-updater init --root <clone-root>
 
 # 2. See existing clones not yet tracked
@@ -63,12 +87,10 @@ This repo publishes a starter lock for the tools we share. It does **not** pin g
 ```powershell
 cd <clone-root>
 git clone https://github.com/Lolaplex/git-updater.git
-python -m pip install -e git-updater
-git-updater init --root .
-git-updater adopt git-updater
-git-updater replicate git-updater/examples/shared.lock --root .
-git-updater adopt agent-memory
+python git-updater/git_updater.py init --root .
 ```
+
+`init` creates the catalog, `pip install -e` this clone, installs the agent skill, adopts git-updater, replicates `examples/shared.lock`, and adopts those repos. If you run `init` inside the git-updater folder with default `--root .`, the clone root becomes the parent.
 
 Daily sync (pull when the other person pushed):
 
@@ -120,9 +142,9 @@ Dirty or diverged repos are **never** force-reset. Use `consolidate` when `updat
 | HTTPS / SSH | `https://gitlab.com/group/project.git`, `git@host:org/repo.git` |
 | Local path | a folder on disk, or `file://` URL |
 
-`adopt` reads `origin` (push target). Extra remotes with the **same GitHub repo name** (owner ignored) are stored as `mirrors`. `vendor.lock` stores `remote` (id), `url` (clone source), and optional `mirrors`. Older locks with only `github` still load.
+`adopt` reads `origin` (push target). Extra remotes are stored as `mirrors` only if they **already contain the pinned SHA**. `vendor.lock` stores `remote` (id), `url` (clone source), and optional `mirrors` (other fetch URLs for that same commit). Older locks with only `github` still load.
 
-**Personal origin + org copy:** `Klix927/agent-memory` and `Lolaplex/agent-memory` are the same project. `replicate` / `update` / `install` fetch every matching remote and add the lock URL as a named remote (GitHub owner, e.g. `lolaplex`) if missing. `push` still uses `origin`.
+**Pins are SHAs.** `Klix927/agent-memory` and `Lolaplex/agent-memory` are different remotes. They are fetch sources for a pin only when that exact commit exists there. `replicate` / `install` fetch `url` plus listed `mirrors` until the lock SHA is present, then check out that SHA. `update` / `push` still follow **origin**. A GitHub repo *name* match is not identity.
 
 ## For repo authors — `.git-updater.yaml`
 
@@ -170,7 +192,7 @@ See [`git-updater.schema.json`](git-updater.schema.json) for the JSON shape.
 
 | Command | Description |
 |---------|-------------|
-| `init [--root PATH]` | Create catalog (default root: current directory) |
+| `init [--root PATH]` | First-run: catalog, pip -e, skills, adopt self, replicate `examples/shared.lock` |
 | `scan` | Git folders under root not in catalog |
 | `add owner/repo [--install CMD]` | Clone + register |
 | `adopt FOLDER [--install CMD]` | Register existing clone (auto-reads manifest) |
@@ -189,8 +211,11 @@ See [`git-updater.schema.json`](git-updater.schema.json) for the JSON shape.
 | `verify [--lock PATH]` | Drift check |
 | `self-check [--fetch] [--json]` | Check if git-updater itself is up to date |
 | `self-update` | Fast-forward git-updater from upstream |
+| `install-skills` | Copy agent skill to `~/.cursor/skills` and `~/.agents/skills` |
+| `help [CMD] [--json]` | Human or JSON help |
+| `man [--write FILE]` | Print / write roff man page |
 
-Global: `--no-self-check` skips the automatic post-command update hint.
+Global: `--no-self-check` skips the automatic post-command update hint. `--help-json` prints the CLI spec and exits.
 
 ## vendor.lock format (v1)
 

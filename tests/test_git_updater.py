@@ -171,7 +171,7 @@ class StatusClassificationTests(unittest.TestCase):
     @mock.patch("git_updater.is_dirty", return_value=False)
     @mock.patch("git_updater.current_commit", return_value="a" * 40)
     @mock.patch("git_updater.current_branch", return_value="main")
-    @mock.patch("git_updater.same_project_remote_names", return_value=["origin"])
+    @mock.patch("git_updater.pin_fetch_remote_names", return_value=["origin"])
     @mock.patch("git_updater.pick_sync_ref", return_value=(None, "current"))
     @mock.patch("git_updater.remote_ahead_behind", return_value=(0, 0))
     def test_pinned(self, *_m: mock.Mock) -> None:
@@ -230,7 +230,7 @@ class ConsolidateTests(unittest.TestCase):
     @mock.patch("git_updater.run_git")
     @mock.patch("git_updater.attach_entry_remotes")
     @mock.patch("git_updater.fetch_all_remotes")
-    @mock.patch("git_updater.same_project_remote_names", return_value=["origin"])
+    @mock.patch("git_updater.pin_fetch_remote_names", return_value=["origin"])
     @mock.patch("git_updater.pick_sync_ref", return_value=(None, "diverged"))
     @mock.patch("git_updater.is_dirty", return_value=False)
     @mock.patch("git_updater.current_branch", return_value="main")
@@ -409,12 +409,20 @@ class SelfCheckTests(unittest.TestCase):
 
 
 class GithubProjectIdentityTests(unittest.TestCase):
-    def test_same_repo_name_different_owner(self) -> None:
-        self.assertTrue(
+    def test_same_repo_name_different_owner_is_not_the_same_clone(self) -> None:
+        self.assertFalse(
             gu.same_github_project(
                 "Klix927/agent-memory",
                 "lolaplex/agent-memory",
                 "https://github.com/Klix927/agent-memory.git",
+                "https://github.com/Lolaplex/agent-memory.git",
+            )
+        )
+
+    def test_same_url_is_equivalent(self) -> None:
+        self.assertTrue(
+            gu.urls_equivalent(
+                "https://github.com/Lolaplex/agent-memory.git",
                 "https://github.com/Lolaplex/agent-memory.git",
             )
         )
@@ -448,7 +456,7 @@ class GithubProjectIdentityTests(unittest.TestCase):
 
 
 class SyncRefTests(unittest.TestCase):
-    def test_ff_org_mirror_when_origin_current(self) -> None:
+    def test_origin_only_even_if_other_remote_is_ahead(self) -> None:
         def fake_ahead(_path: Path, _branch: str, remote: str) -> tuple[int, int]:
             if remote == "origin":
                 return (0, 0)
@@ -458,8 +466,8 @@ class SyncRefTests(unittest.TestCase):
 
         with mock.patch("git_updater.remote_ahead_behind", side_effect=fake_ahead):
             ref, kind = gu.pick_sync_ref(Path("/tmp/r"), "main", ["origin", "lolaplex"])
-        self.assertEqual(kind, "behind")
-        self.assertEqual(ref, "lolaplex/main")
+        self.assertEqual(kind, "current")
+        self.assertIsNone(ref)
 
     def test_origin_diverged_wins(self) -> None:
         def fake_ahead(_path: Path, _branch: str, remote: str) -> tuple[int, int]:
@@ -471,6 +479,45 @@ class SyncRefTests(unittest.TestCase):
             ref, kind = gu.pick_sync_ref(Path("/tmp/r"), "main", ["origin", "lolaplex"])
         self.assertEqual(kind, "diverged")
         self.assertIsNone(ref)
+
+    def test_origin_behind_ffs_origin(self) -> None:
+        with mock.patch("git_updater.remote_ahead_behind", return_value=(0, 2)):
+            ref, kind = gu.pick_sync_ref(Path("/tmp/r"), "main", ["origin", "lolaplex"])
+        self.assertEqual(kind, "behind")
+        self.assertEqual(ref, "origin/main")
+
+
+class MirrorShaTests(unittest.TestCase):
+    def test_extra_remote_without_sha_is_not_a_mirror(self) -> None:
+        remotes = [
+            ("origin", "https://github.com/me/app.git", "me/app"),
+            ("lolaplex", "https://github.com/Lolaplex/app.git", "lolaplex/app"),
+        ]
+        with mock.patch("git_updater.list_remotes", return_value=remotes):
+            with mock.patch("git_updater.remotes_containing_commit", return_value={"origin"}):
+                mirrors = gu.mirrors_from_clone(
+                    Path("/tmp/app"),
+                    "https://github.com/me/app.git",
+                    "a" * 40,
+                )
+        self.assertEqual(mirrors, [])
+
+    def test_extra_remote_with_sha_is_a_fetch_source(self) -> None:
+        remotes = [
+            ("origin", "https://github.com/me/app.git", "me/app"),
+            ("lolaplex", "https://github.com/Lolaplex/app.git", "lolaplex/app"),
+        ]
+        with mock.patch("git_updater.list_remotes", return_value=remotes):
+            with mock.patch(
+                "git_updater.remotes_containing_commit",
+                return_value={"origin", "lolaplex"},
+            ):
+                mirrors = gu.mirrors_from_clone(
+                    Path("/tmp/app"),
+                    "https://github.com/me/app.git",
+                    "a" * 40,
+                )
+        self.assertEqual(mirrors, ["https://github.com/Lolaplex/app.git"])
 
 
 class CheckoutPinTests(unittest.TestCase):
@@ -496,6 +543,109 @@ class CheckoutPinTests(unittest.TestCase):
             gu.checkout_pin(Path("/tmp/r"), "deadbeef")
         self.assertIn("not found", str(raised.exception))
         mock_fetch.assert_called_once()
+
+
+class HelpSpecTests(unittest.TestCase):
+    def test_cli_spec_lists_commands_and_global_flags(self) -> None:
+        spec = gu.cli_spec()
+        names = {c["name"] for c in spec["commands"]}
+        self.assertIn("init", names)
+        self.assertIn("replicate", names)
+        self.assertIn("help", names)
+        self.assertIn("man", names)
+        self.assertIn("install-skills", names)
+        flags = {f for opt in spec["options"] for f in opt.get("flags", [])}
+        self.assertIn("--help-json", flags)
+        init = next(c for c in spec["commands"] if c["name"] == "init")
+        self.assertTrue(init["help"])
+        self.assertTrue(any("--root" in o.get("flags", []) for o in init["options"]))
+
+    def test_help_json_filters_command(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            gu.main(["--help-json", "replicate"])
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["command"]["name"], "replicate")
+        self.assertTrue(payload["command"]["arguments"])
+
+    def test_man_page_is_roff(self) -> None:
+        man = gu.render_man()
+        self.assertIn(".TH GIT-UPDATER 1", man)
+        self.assertIn("git-updater", man)
+        self.assertIn(".B init", man)
+        self.assertIn("--help-json", man)
+
+
+class SkillInstallTests(unittest.TestCase):
+    def test_template_has_frontmatter(self) -> None:
+        text = gu.skill_template_path().read_text(encoding="utf-8")
+        self.assertIn("name: git-updater", text)
+        self.assertIn("git-updater --help-json", text)
+        self.assertIn(gu.SKILL_PATHS_BEGIN, text)
+
+    def test_install_user_skills_writes_cursor_and_agents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            written = gu.install_user_skills(home=home)
+            self.assertEqual(len(written), 2)
+            root = gu.normalize_path(gu.install_root())
+            for path in written:
+                self.assertTrue(path.is_file())
+                body = path.read_text(encoding="utf-8")
+                self.assertIn("name: git-updater", body)
+                self.assertIn(root, body)
+            cursor = home / ".cursor" / "skills" / "git-updater" / "SKILL.md"
+            agents = home / ".agents" / "skills" / "git-updater" / "SKILL.md"
+            self.assertTrue(cursor.is_file())
+            self.assertTrue(agents.is_file())
+
+
+class InitBootstrapTests(unittest.TestCase):
+    def test_infer_clone_root_uses_parent_of_this_checkout(self) -> None:
+        self_root = gu.install_root()
+        self.assertEqual(gu.infer_clone_root(str(self_root)), self_root.parent.resolve())
+
+    def test_init_writes_catalog_without_pip_or_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            catalog_path = tmp_p / "catalog.json"
+            config = tmp_p / "cfg"
+            config.mkdir()
+            root = tmp_p / "repos"
+            root.mkdir()
+            ns = argparse_namespace(
+                root=str(root),
+                force=False,
+                no_pip=True,
+                no_lock=True,
+                lock=None,
+            )
+            with mock.patch.object(gu, "CATALOG_PATH", catalog_path):
+                with mock.patch.object(gu, "CONFIG_DIR", config):
+                    with mock.patch.object(gu, "LOG_DIR", config / "logs"):
+                        with mock.patch.object(
+                            gu, "install_user_skills", return_value=[config / "skill.md"]
+                        ) as skills:
+                            with mock.patch.object(gu, "pip_editable_self") as pip:
+                                with mock.patch.object(gu, "replicate_lockfile") as repl:
+                                    gu.cmd_init(ns)
+            pip.assert_not_called()
+            repl.assert_not_called()
+            skills.assert_called_once()
+            data = json.loads(catalog_path.read_text(encoding="utf-8"))
+            self.assertEqual(Path(data["root"]).resolve(), root.resolve())
+            self.assertEqual(data["repos"], [])
+
+    def test_cli_init_flags(self) -> None:
+        spec = gu.cli_spec()
+        init = next(c for c in spec["commands"] if c["name"] == "init")
+        flags = {f for opt in init["options"] for f in opt.get("flags", [])}
+        self.assertIn("--no-lock", flags)
+        self.assertIn("--no-pip", flags)
+        self.assertIn("--lock", flags)
 
 
 if __name__ == "__main__":

@@ -24,7 +24,12 @@ CATALOG_PATH = CONFIG_DIR / "catalog.json"
 LOG_DIR = CONFIG_DIR / "logs"
 SELF_CHECK_CACHE = CONFIG_DIR / "self-check.json"
 SELF_CHECK_TTL_SECS = 24 * 60 * 60
-SKIP_SELF_CHECK_COMMANDS = frozenset({"self-check", "self-update", "init"})
+SKIP_SELF_CHECK_COMMANDS = frozenset(
+    {"self-check", "self-update", "init", "help", "man", "install-skills"}
+)
+SKILL_NAME = "git-updater"
+SKILL_PATHS_BEGIN = "<!-- git-updater-paths -->"
+SKILL_PATHS_END = "<!-- /git-updater-paths -->"
 
 MANIFEST_FILENAMES = (
     ".git-updater.json",
@@ -163,6 +168,80 @@ def write_log(command: str, lines: list[str]) -> Path:
 
 def install_root() -> Path:
     return Path(__file__).resolve().parent
+
+
+def skill_template_path() -> Path:
+    return install_root() / "skills" / SKILL_NAME / "SKILL.md"
+
+
+def user_skill_targets(home: Path | None = None) -> list[Path]:
+    home = home or Path.home()
+    return [
+        home / ".cursor" / "skills" / SKILL_NAME / "SKILL.md",
+        home / ".agents" / "skills" / SKILL_NAME / "SKILL.md",
+    ]
+
+
+def machine_skill_text(root: Path | None = None) -> str:
+    template_path = skill_template_path()
+    if not template_path.is_file():
+        raise SystemExit(f"Missing skill template: {template_path}")
+    template = template_path.read_text(encoding="utf-8")
+    root = root or install_root()
+    root_s = normalize_path(root)
+    block = (
+        f"Install (engine): `{root_s}`\n"
+        "Invoke (PATH): `git-updater` after `python -m pip install -e .` from that clone.\n"
+        f"Fallback: `python {root_s}/git_updater.py`\n"
+        "Machine-readable spec: `git-updater --help-json` (or `git-updater --help-json COMMAND`).\n"
+    )
+    if SKILL_PATHS_BEGIN in template and SKILL_PATHS_END in template:
+        pre, rest = template.split(SKILL_PATHS_BEGIN, 1)
+        _, post = rest.split(SKILL_PATHS_END, 1)
+        return pre + SKILL_PATHS_BEGIN + "\n" + block + SKILL_PATHS_END + post
+    return template
+
+
+def install_user_skills(home: Path | None = None) -> list[Path]:
+    text = machine_skill_text()
+    written: list[Path] = []
+    for path in user_skill_targets(home):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        written.append(path)
+    return written
+
+
+def cmd_install_skills(args: argparse.Namespace) -> None:
+    for path in install_user_skills():
+        print(f"Wrote {path}")
+
+
+def pip_editable_self() -> None:
+    root = install_root()
+    print(f"-> {sys.executable} -m pip install -e {root}")
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-e", str(root)],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit("pip install -e failed; git-updater is not on PATH")
+
+
+def infer_clone_root(root_arg: str) -> Path:
+    """If --root is this checkout, use the parent so stacks land next to git-updater."""
+    requested = Path(root_arg).expanduser().resolve()
+    self_root = install_root()
+    if requested == self_root:
+        parent = self_root.parent
+        print(f"This checkout is git-updater; clone root -> {parent}")
+        return parent
+    return requested
+
+
+def default_stack_lock() -> Path | None:
+    path = install_root() / "examples" / "shared.lock"
+    return path if path.is_file() else None
 
 
 def resolve_self_remote(install_path: Path | None = None) -> str:
@@ -578,16 +657,8 @@ def same_github_project(
     url_a: str | None = None,
     url_b: str | None = None,
 ) -> bool:
-    """Same clone, or GitHub remotes that share a repo name (owner ignored)."""
-    id_a = remote_id_from_url(url_a or remote_a).lower()
-    id_b = remote_id_from_url(url_b or remote_b).lower()
-    if id_a == id_b:
-        return True
-    parts_a = github_owner_repo(remote_a, url_a)
-    parts_b = github_owner_repo(remote_b, url_b)
-    if parts_a and parts_b:
-        return parts_a[1] == parts_b[1]
-    return False
+    """True only when both sides are the same clone URL/id. Owner+name, not name alone."""
+    return urls_equivalent(url_a or remote_a, url_b or remote_b)
 
 
 def list_remotes(path: Path) -> list[tuple[str, str, str]]:
@@ -661,13 +732,40 @@ def attach_entry_remotes(path: Path, entry: RepoEntry) -> None:
         ensure_remote(path, url)
 
 
-def mirrors_from_clone(path: Path, origin_id: str, origin_url: str) -> list[str]:
+def remotes_containing_commit(path: Path, commit: str) -> set[str]:
+    """Remote names whose tracking refs contain this SHA (empty if unknown)."""
+    if not commit or not commit_exists(path, commit):
+        return set()
+    result = run_git(path, "branch", "-r", "--contains", commit, check=False)
+    if result.returncode != 0:
+        return set()
+    names: set[str] = set()
+    for line in result.stdout.splitlines():
+        ref = line.strip()
+        if not ref or " -> " in ref:
+            continue
+        if "/" in ref:
+            names.add(ref.split("/", 1)[0])
+    return names
+
+
+def mirrors_from_clone(
+    path: Path,
+    origin_url: str,
+    commit: str | None = None,
+) -> list[str]:
+    """Extra remotes that actually have this commit. Name matching is not identity."""
+    commit = commit or current_commit(path)
+    containing = remotes_containing_commit(path, commit) if commit else set()
     mirrors: list[str] = []
-    for _name, url, rid in list_remotes(path):
+    for name, url, _rid in list_remotes(path):
         if urls_equivalent(url, origin_url):
             continue
-        if same_github_project(origin_id, rid, origin_url, url):
-            mirrors.append(url)
+        if containing and name not in containing:
+            continue
+        if not containing:
+            continue
+        mirrors.append(url)
     return mirrors
 
 
@@ -676,19 +774,16 @@ def commit_exists(path: Path, commit: str) -> bool:
     return result.returncode == 0
 
 
-def same_project_remote_names(path: Path, entry: RepoEntry) -> list[str]:
-    extra = entry_fetch_urls(entry)
+def pin_fetch_remote_names(path: Path, entry: RepoEntry) -> list[str]:
+    """Remotes we may fetch the pin SHA from. Not which branch tip to follow."""
+    wanted = entry_fetch_urls(entry)
     names: list[str] = []
-    remotes = list_remotes(path)
-    for name, url, rid in remotes:
-        if same_github_project(entry.remote, rid, entry.url, url):
-            names.append(name)
-            continue
-        if any(same_github_project(entry.remote, rid, extra_url, url) for extra_url in extra):
+    for name, url, _rid in list_remotes(path):
+        if name == "origin" or any(urls_equivalent(url, w) for w in wanted):
             names.append(name)
     if names:
         return names
-    existing = [name for name, _, _ in remotes]
+    existing = [name for name, _, _ in list_remotes(path)]
     if "origin" in existing:
         return ["origin"]
     return existing[:1]
@@ -702,6 +797,7 @@ def fetch_all_remotes(path: Path, extra_urls: list[str] | None = None) -> None:
 
 
 def fetch_commit(path: Path, commit: str, extra_urls: list[str] | None = None) -> None:
+    """Fetch until the pin SHA exists. Extra URLs are fetch sources, not aliases."""
     if commit_exists(path, commit):
         return
     remotes = list_remotes(path)
@@ -743,29 +839,13 @@ def remote_ahead_behind(path: Path, branch: str, remote: str) -> tuple[int, int]
 
 
 def pick_sync_ref(path: Path, branch: str, remote_names: list[str]) -> tuple[str | None, str]:
-    """Pick a fast-forward ref across same-project remotes.
-
-    origin diverged → stop. Else prefer the farthest ff-able remote (e.g. org
-    mirror ahead of personal origin). kind: current | behind | diverged.
-    """
-    if "origin" in remote_names:
-        ahead, behind = remote_ahead_behind(path, branch, "origin")
-        if ahead and behind:
-            return None, "diverged"
-    ff_refs: list[tuple[int, str]] = []
-    any_diverged = False
-    for remote in remote_names:
-        ahead, behind = remote_ahead_behind(path, branch, remote)
-        if ahead and behind:
-            any_diverged = True
-            continue
-        if behind:
-            ff_refs.append((behind, f"{remote}/{branch}"))
-    if ff_refs:
-        ff_refs.sort(key=lambda item: item[0], reverse=True)
-        return ff_refs[0][1], "behind"
-    if any_diverged:
+    """Fast-forward target is origin (push/pull). Extra remotes are pin-fetch only."""
+    remote = "origin" if "origin" in remote_names else (remote_names[0] if remote_names else "origin")
+    ahead, behind = remote_ahead_behind(path, branch, remote)
+    if ahead and behind:
         return None, "diverged"
+    if behind:
+        return f"{remote}/{branch}", "behind"
     return None, "current"
 
 
@@ -818,7 +898,7 @@ def classify_repo(catalog: Catalog, entry: RepoEntry, fetch: bool = False) -> st
         return "missing"
     if fetch:
         fetch_all_remotes(path, entry_fetch_urls(entry))
-    names = same_project_remote_names(path, entry)
+    names = pin_fetch_remote_names(path, entry)
     branch = current_branch(path) or entry.branch
     _ref, sync = pick_sync_ref(path, branch, names)
     origin_ahead, _origin_behind = remote_ahead_behind(path, branch, "origin")
@@ -1193,9 +1273,8 @@ def checkout_pin(
     if not commit_exists(path, commit):
         raise SystemExit(
             f"Commit {commit[:7]} not found in {path}. "
-            "Tried every git remote plus lock/catalog URLs. "
-            "Same GitHub repo name under a different owner is treated as the "
-            "same project — add that remote or check the lock SHA."
+            "The pin is that SHA. Fetched origin plus lock/catalog url and mirrors. "
+            "Add a remote that actually has this commit (git remote add <name> <url>)."
         )
     try:
         run_git(path, "checkout", "--detach", commit)
@@ -1291,7 +1370,7 @@ def consolidate_repo(
     branch = current_branch(path) or entry.branch
     attach_entry_remotes(path, entry)
     fetch_all_remotes(path, entry_fetch_urls(entry))
-    names = same_project_remote_names(path, entry)
+    names = pin_fetch_remote_names(path, entry)
     ref, sync = pick_sync_ref(path, branch, names)
     merge_ref = ref or default_sync_ref(branch, names)
     old_commit = entry.commit
@@ -1348,13 +1427,50 @@ def consolidate_repo(
 
 def cmd_init(args: argparse.Namespace) -> None:
     ensure_config_dir()
-    root = normalize_path(args.root)
+    root_path = infer_clone_root(args.root)
+    root = normalize_path(root_path)
     if CATALOG_PATH.exists() and not args.force:
         raise SystemExit(f"Catalog already exists at {CATALOG_PATH} (use --force)")
     catalog = Catalog(version=CATALOG_VERSION, root=root, repos=[])
     save_catalog(catalog)
     print(f"Initialized catalog at {CATALOG_PATH}")
     print(f"Clone root: {root}")
+
+    if not args.no_pip:
+        pip_editable_self()
+
+    for path in install_user_skills():
+        print(f"Wrote {path}")
+
+    catalog = load_catalog()
+    adopt_if_needed(catalog, install_root())
+
+    lock_path: Path | None = None
+    if args.lock:
+        lock_path = Path(args.lock).expanduser()
+    elif not args.no_lock:
+        lock_path = default_stack_lock()
+    if lock_path and lock_path.is_file():
+        catalog = load_catalog()
+        print(f"-> replicate {lock_path}")
+        log_lines = replicate_lockfile(
+            lock_path,
+            Path(catalog.root),
+            dry_run=False,
+            update_existing=False,
+        )
+        if log_lines:
+            log_path = write_log("init", log_lines)
+            print(f"Log: {log_path}")
+        catalog = load_catalog()
+        data = load_lock(lock_path)
+        for raw in data.get("repos", []):
+            entry = RepoEntry.from_dict(raw)
+            dest = Path(catalog.root) / entry.path
+            adopt_if_needed(catalog, dest, name=entry.name)
+            catalog = load_catalog()
+    elif args.lock:
+        raise SystemExit(f"Lock not found: {lock_path}")
 
 
 def cmd_consolidate(args: argparse.Namespace) -> None:
@@ -1405,7 +1521,8 @@ def cmd_scan(args: argparse.Namespace) -> None:
         slug = origin[0] if origin else "?"
         extra = ""
         if origin:
-            aliases = mirrors_from_clone(path, origin[0], origin[1])
+            commit = current_commit(path)
+            aliases = mirrors_from_clone(path, origin[1], commit)
             if aliases:
                 extra = " (+" + ", ".join(remote_id_from_url(url) for url in aliases) + ")"
         manifest = discover_repo_hooks(path)
@@ -1454,18 +1571,18 @@ def cmd_add(args: argparse.Namespace) -> None:
     print(f"Added {name} @ {commit[:7]}")
 
 
-def cmd_adopt(args: argparse.Namespace) -> None:
-    catalog = load_catalog()
-    folder = args.folder
-    path = Path(folder)
-    if not path.is_absolute():
-        path = Path(catalog.root) / folder
+def entry_from_clone(
+    catalog: Catalog,
+    path: Path,
+    *,
+    name: str | None = None,
+    branch: str | None = None,
+    install: str | None = None,
+) -> RepoEntry:
     path = path.resolve()
     root = Path(catalog.root).resolve()
-
     if not path.is_relative_to(root):
         raise SystemExit(f"Path must be under clone root {root}")
-
     origin = read_origin(path)
     remotes = list_remotes(path)
     if not origin:
@@ -1473,40 +1590,87 @@ def cmd_adopt(args: argparse.Namespace) -> None:
             origin = (remotes[0][2], remotes[0][1])
         else:
             raise SystemExit(f"Not a git repo with remotes: {path}")
-
     remote_id, url = origin
-    mirrors = mirrors_from_clone(path, remote_id, url)
-    rel = path.relative_to(root).as_posix()
-    name = args.name or unique_name(catalog, path.name)
-    branch = current_branch(path) or args.branch or "main"
+    resolved_branch = current_branch(path) or branch or "main"
     commit = current_commit(path)
     if not commit:
         raise SystemExit(f"Could not read HEAD: {path}")
-
-    if catalog.find(name):
-        raise SystemExit(f"Name already in catalog: {name}")
-
+    for remote_name, _url, _rid in remotes:
+        run_git(path, "fetch", remote_name, check=False)
+    mirrors = mirrors_from_clone(path, url, commit)
+    rel = path.relative_to(root).as_posix()
+    chosen = name or unique_name(catalog, path.name)
     entry = RepoEntry(
-        name=name,
+        name=chosen,
         remote=remote_id,
         url=url,
         path=rel,
-        branch=branch,
+        branch=resolved_branch,
         commit=commit,
         mirrors=mirrors,
     )
-    if args.install:
-        entry.install = args.install
+    if install:
+        entry.install = install
     else:
         manifest = discover_repo_hooks(path)
         if manifest:
             apply_manifest_to_entry(entry, manifest)
             print(f"  hooks from {manifest.source}")
+    return entry
+
+
+def adopt_if_needed(
+    catalog: Catalog,
+    path: Path,
+    *,
+    name: str | None = None,
+) -> RepoEntry | None:
+    path = Path(path).resolve()
+    root = Path(catalog.root).resolve()
+    if not path.exists():
+        return None
+    if not path.is_relative_to(root):
+        print(f"  skip adopt {path.name}: outside clone root {root}")
+        return None
+    for existing in catalog.repos:
+        if (root / existing.path).resolve() == path:
+            return existing
+    try:
+        entry = entry_from_clone(catalog, path, name=name)
+    except SystemExit as exc:
+        print(f"  skip adopt {path.name}: {exc}")
+        return None
+    if catalog.find(entry.name):
+        print(f"  skip adopt {entry.name}: name already in catalog")
+        return None
     catalog.repos.append(entry)
     save_catalog(catalog)
-    print(f"Adopted {name} @ {commit[:7]} ({remote_id})")
-    if mirrors:
-        print("  same project: " + ", ".join(remote_id_from_url(m) for m in mirrors))
+    print(f"Adopted {entry.name} @ {entry.commit[:7]} ({entry.remote})")
+    return entry
+
+
+def cmd_adopt(args: argparse.Namespace) -> None:
+    catalog = load_catalog()
+    folder = args.folder
+    path = Path(folder)
+    if not path.is_absolute():
+        path = Path(catalog.root) / folder
+    path = path.resolve()
+    name = args.name or unique_name(catalog, path.name)
+    if catalog.find(name):
+        raise SystemExit(f"Name already in catalog: {name}")
+    entry = entry_from_clone(
+        catalog,
+        path,
+        name=name,
+        branch=args.branch,
+        install=args.install,
+    )
+    catalog.repos.append(entry)
+    save_catalog(catalog)
+    print(f"Adopted {entry.name} @ {entry.commit[:7]} ({entry.remote})")
+    if entry.mirrors:
+        print("  fetch remotes: " + ", ".join(remote_id_from_url(m) for m in entry.mirrors))
 
 
 def cmd_sync_hooks(args: argparse.Namespace) -> None:
@@ -1629,7 +1793,7 @@ def cmd_update(args: argparse.Namespace) -> None:
         branch = current_branch(path) or entry.branch
         attach_entry_remotes(path, entry)
         fetch_all_remotes(path, entry_fetch_urls(entry))
-        names = same_project_remote_names(path, entry)
+        names = pin_fetch_remote_names(path, entry)
         ref, sync = pick_sync_ref(path, branch, names)
         old_commit = entry.commit
         if sync == "behind" and ref:
@@ -1692,19 +1856,21 @@ def cmd_export(args: argparse.Namespace) -> None:
     export_lock(catalog, out)
 
 
-def cmd_replicate(args: argparse.Namespace) -> None:
-    lock_path = Path(args.lockfile)
+def replicate_lockfile(
+    lock_path: Path,
+    root_path: Path,
+    *,
+    dry_run: bool = False,
+    update_existing: bool = True,
+) -> list[str]:
     data = load_lock(lock_path)
-    root_path = resolve_lock_root(lock_path, data, args.root)
-    print(f"Replicate root: {root_path}")
     log_lines: list[str] = []
-
     for raw in data.get("repos", []):
         entry = RepoEntry.from_dict(raw)
         dest = root_path / entry.path
         print(f"-> {entry.name}")
 
-        if args.dry_run:
+        if dry_run:
             action = "clone+checkout" if not dest.exists() else "checkout"
             print(f"  [dry-run] would {action} @ {entry.commit[:7]}")
             if entry.install:
@@ -1715,11 +1881,13 @@ def cmd_replicate(args: argparse.Namespace) -> None:
                     print(f"  [dry-run] would run install ({origin}): {cmd}")
             continue
 
+        cloned = False
         if not dest.exists():
             clone_repo(entry.url, dest, entry.branch)
             checkout_pin(dest, entry.commit, entry_fetch_urls(entry))
+            cloned = True
             log_lines.append(f"cloned {entry.name}")
-        else:
+        elif update_existing:
             attach_entry_remotes(dest, entry)
             head = current_commit(dest)
             if head != entry.commit:
@@ -1727,11 +1895,28 @@ def cmd_replicate(args: argparse.Namespace) -> None:
                 log_lines.append(f"checked out {entry.name} @ {entry.commit[:7]}")
             else:
                 print(f"  already at {entry.commit[:7]}")
+        else:
+            attach_entry_remotes(dest, entry)
+            print(f"  exists, leaving tree")
 
-        if resolve_hook_command(entry, dest, "install")[0]:
-            run_install(entry, dest)
-            log_lines.append(f"installed {entry.name}")
+        if cloned or update_existing:
+            if resolve_hook_command(entry, dest, "install")[0]:
+                run_install(entry, dest)
+                log_lines.append(f"installed {entry.name}")
+    return log_lines
 
+
+def cmd_replicate(args: argparse.Namespace) -> None:
+    lock_path = Path(args.lockfile)
+    data = load_lock(lock_path)
+    root_path = resolve_lock_root(lock_path, data, args.root)
+    print(f"Replicate root: {root_path}")
+    log_lines = replicate_lockfile(
+        lock_path,
+        root_path,
+        dry_run=args.dry_run,
+        update_existing=True,
+    )
     if log_lines:
         log_path = write_log("replicate", log_lines)
         print(f"Log: {log_path}")
@@ -1762,6 +1947,8 @@ def cmd_self_update(args: argparse.Namespace) -> None:
     result = check_self(fetch=True, use_cache=False)
     print(format_self_check(result))
     if result.status == "up-to-date":
+        for path in install_user_skills():
+            print(f"Wrote {path}")
         return
     if result.status == "dirty":
         raise SystemExit("Refusing to self-update: working tree has local changes.")
@@ -1778,6 +1965,8 @@ def cmd_self_update(args: argparse.Namespace) -> None:
     if new_head:
         print(f"Updated to {new_head[:7]}")
     check_self(fetch=False, use_cache=False)
+    for path in install_user_skills():
+        print(f"Wrote {path}")
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
@@ -1815,25 +2004,274 @@ def cmd_verify(args: argparse.Namespace) -> None:
     print(f"All {len(entries)} repos match lock.")
 
 
+def package_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("git-updater")
+    except Exception:
+        return "0.1.0"
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
+def _action_spec(action: argparse.Action) -> dict[str, Any] | None:
+    if action.help is argparse.SUPPRESS:
+        return None
+    if action.option_strings and action.option_strings[0] in ("-h", "--help"):
+        return None
+    if action.dest in ("help", "func"):
+        return None
+    if isinstance(action, argparse._SubParsersAction):
+        return None
+    flags = list(action.option_strings)
+    is_option = bool(flags)
+    is_flag = action.nargs == 0 or isinstance(action, argparse._StoreTrueAction)
+    spec: dict[str, Any] = {
+        "name": action.metavar or action.dest,
+        "dest": action.dest,
+        "help": action.help or "",
+        "required": bool(action.required),
+    }
+    if is_option:
+        spec["flags"] = flags
+        spec["kind"] = "flag" if is_flag else "option"
+    else:
+        spec["kind"] = "argument"
+        if action.nargs is not None:
+            spec["nargs"] = str(action.nargs)
+    default = action.default
+    if default is not argparse.SUPPRESS and default is not None:
+        spec["default"] = _json_safe(default)
+    if action.choices:
+        spec["choices"] = [_json_safe(c) for c in action.choices]
+    return spec
+
+
+def cli_spec(parser: argparse.ArgumentParser | None = None) -> dict[str, Any]:
+    """Machine-readable CLI description derived from argparse (source of truth)."""
+    parser = parser or build_parser()
+    options: list[dict[str, Any]] = []
+    arguments: list[dict[str, Any]] = []
+    commands: list[dict[str, Any]] = []
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            helps = {
+                choice.dest: (choice.help or "")
+                for choice in getattr(action, "_choices_actions", [])
+            }
+            for name, sub in action.choices.items():
+                commands.append(cli_spec_command(name, sub, helps.get(name, "")))
+            continue
+        item = _action_spec(action)
+        if not item:
+            continue
+        if item["kind"] == "argument":
+            arguments.append(item)
+        else:
+            options.append(item)
+    return {
+        "name": parser.prog,
+        "version": package_version(),
+        "description": parser.description or "",
+        "usage": parser.format_usage().strip(),
+        "options": options,
+        "arguments": arguments,
+        "commands": commands,
+    }
+
+
+def cli_spec_command(
+    name: str, parser: argparse.ArgumentParser, help_text: str = ""
+) -> dict[str, Any]:
+    options: list[dict[str, Any]] = []
+    arguments: list[dict[str, Any]] = []
+    for action in parser._actions:
+        item = _action_spec(action)
+        if not item:
+            continue
+        if item["kind"] == "argument":
+            arguments.append(item)
+        else:
+            options.append(item)
+    return {
+        "name": name,
+        "description": (parser.description or help_text or "").strip(),
+        "help": help_text or (parser.description or ""),
+        "usage": parser.format_usage().strip(),
+        "arguments": arguments,
+        "options": options,
+    }
+
+
+def render_man(spec: dict[str, Any] | None = None) -> str:
+    spec = spec or cli_spec()
+    name = spec["name"]
+    lines = [
+        f'.TH {name.upper()} 1 "{datetime.now(timezone.utc).strftime("%B %Y")}" "{spec["version"]}" "User Commands"',
+        ".SH NAME",
+        f'{name} \\- {spec["description"]}',
+        ".SH SYNOPSIS",
+        ".B " + name,
+        "[\\fIOPTIONS\\fR]",
+        "\\fICOMMAND\\fR",
+        "[\\fIARGS\\fR]",
+        ".SH DESCRIPTION",
+        spec["description"],
+        "",
+        "Machine-readable help:",
+        ".P",
+        f".B {name} --help-json",
+        ".SH OPTIONS",
+    ]
+    for opt in spec.get("options", []):
+        flags = ", ".join(opt.get("flags", []))
+        lines.append(".TP")
+        lines.append(f".B {flags}")
+        extra = opt.get("help") or ""
+        if "default" in opt:
+            extra += f" (default: {opt['default']})"
+        lines.append(extra or ".")
+    lines.append(".SH COMMANDS")
+    for cmd in spec.get("commands", []):
+        lines.append(".TP")
+        lines.append(f".B {cmd['name']}")
+        lines.append(cmd.get("help") or cmd.get("description") or ".")
+        for arg in cmd.get("arguments", []):
+            lines.append(".br")
+            req = "required" if arg.get("required") else "optional"
+            lines.append(f"{arg['name']} ({req}) {arg.get('help') or ''}".strip())
+        for opt in cmd.get("options", []):
+            lines.append(".br")
+            flags = ", ".join(opt.get("flags", []))
+            lines.append(f"{flags}  {opt.get('help') or ''}".strip())
+    lines.extend(
+        [
+            ".SH FILES",
+            "~/.git-updater/catalog.json",
+            ".br",
+            "Machine-local catalog (clone root, pins).",
+            ".br",
+            "<clone-root>/vendor.lock",
+            ".br",
+            "Shareable SHA pins (relative paths only).",
+            ".SH EXIT STATUS",
+            "0 on success. Non-zero on error, verify drift, or self-check behind/dirty/diverged.",
+            ".SH SEE ALSO",
+            f"{name} --help, {name} --help-json, {name} man",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def emit_help_json(argv: list[str], parser: argparse.ArgumentParser) -> None:
+    spec = cli_spec(parser)
+    topic = None
+    for token in argv:
+        if token.startswith("-"):
+            continue
+        topic = token
+        break
+    if topic:
+        match = next((c for c in spec["commands"] if c["name"] == topic), None)
+        if match is None:
+            raise SystemExit(f"unknown command: {topic}")
+        payload: dict[str, Any] = {
+            "name": spec["name"],
+            "version": spec["version"],
+            "command": match,
+        }
+    else:
+        payload = spec
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def cmd_help(args: argparse.Namespace) -> None:
+    parser = build_parser()
+    spec = cli_spec(parser)
+    if args.json:
+        if args.topic:
+            match = next((c for c in spec["commands"] if c["name"] == args.topic), None)
+            if match is None:
+                raise SystemExit(f"unknown command: {args.topic}")
+            print(
+                json.dumps(
+                    {
+                        "name": spec["name"],
+                        "version": spec["version"],
+                        "command": match,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            print(json.dumps(spec, indent=2, ensure_ascii=False))
+        return
+    if args.topic:
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction) and args.topic in action.choices:
+                action.choices[args.topic].print_help()
+                return
+        raise SystemExit(f"unknown command: {args.topic}")
+    parser.print_help()
+
+
+def cmd_man(args: argparse.Namespace) -> None:
+    text = render_man()
+    if args.write:
+        path = Path(args.write)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        print(f"Wrote {path}")
+        return
+    sys.stdout.write(text)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="git-updater",
         description="Track git repos, pin commits, export vendor.lock, replicate stacks.",
+        epilog="Machine-readable: git-updater --help-json [COMMAND]. Man page: git-updater man.",
     )
     parser.add_argument(
         "--no-self-check",
         action="store_true",
         help="Skip automatic self-update check after command",
     )
+    parser.add_argument(
+        "--help-json",
+        action="store_true",
+        help="Print machine-readable CLI spec as JSON and exit",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("init", help="Create ~/.git-updater/catalog.json")
+    p = sub.add_parser(
+        "init",
+        help="First-run setup: catalog, pip -e this clone, skills, adopt self, replicate shared.lock",
+    )
     p.add_argument(
         "--root",
         default=".",
-        help="Clone root directory (default: current directory)",
+        help="Clone root (default: cwd; if cwd is this checkout, its parent)",
     )
     p.add_argument("--force", action="store_true", help="Overwrite existing catalog")
+    p.add_argument(
+        "--lock",
+        help="Replicate this lock after init (default: examples/shared.lock if present)",
+    )
+    p.add_argument("--no-lock", action="store_true", help="Skip stack lock replicate")
+    p.add_argument(
+        "--no-pip",
+        action="store_true",
+        help="Skip pip install -e of this checkout",
+    )
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("scan", help="List git repos under root not in catalog")
@@ -1846,7 +2284,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--name", help="Catalog name (default: repo name)")
     p.add_argument("--path", help="Relative path under root")
-    p.add_argument("--branch", default="main")
+    p.add_argument("--branch", default="main", help="Branch to clone (default: main)")
     p.add_argument(
         "--install",
         help="Override install hook (default: read .git-updater.yaml from repo)",
@@ -1871,7 +2309,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_sync_hooks)
 
     p = sub.add_parser("rm", help="Remove from catalog (keeps folder)")
-    p.add_argument("name")
+    p.add_argument("name", help="Catalog name")
     p.set_defaults(func=cmd_rm)
 
     p = sub.add_parser("status", help="Show pin status")
@@ -1929,7 +2367,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--root",
         help="Clone root on this machine (default: directory that contains the lockfile)",
     )
-    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--dry-run", action="store_true", help="Print actions without cloning")
     p.set_defaults(func=cmd_replicate)
 
     p = sub.add_parser("verify", help="Check clones match lock (exit 1 on drift)")
@@ -1949,12 +2387,31 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("self-update", help="Fast-forward git-updater to latest upstream")
     p.set_defaults(func=cmd_self_update)
 
+    p = sub.add_parser(
+        "install-skills",
+        help="Copy the git-updater agent skill to ~/.cursor/skills and ~/.agents/skills",
+    )
+    p.set_defaults(func=cmd_install_skills)
+
+    p = sub.add_parser("help", help="Show help; --json for the machine-readable spec")
+    p.add_argument("topic", nargs="?", help="Command name")
+    p.add_argument("--json", action="store_true", help="Print CLI spec as JSON")
+    p.set_defaults(func=cmd_help)
+
+    p = sub.add_parser("man", help="Print man page (roff) to stdout")
+    p.add_argument("--write", help="Write roff to this file instead of stdout")
+    p.set_defaults(func=cmd_man)
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
+    argv_list = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    if "--help-json" in argv_list:
+        emit_help_json([t for t in argv_list if t != "--help-json"], parser)
+        return
+    args = parser.parse_args(argv_list)
     args.func(args)
     if (
         not args.no_self_check

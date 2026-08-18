@@ -16,3 +16,7 @@ git-updater = "git_updater:main"
 
 [tool.setuptools]
 py-modules = ["git_updater"]
+
+[tool.setuptools.data-files]
+"share/man/man1" = ["man/git-updater.1"]
+

@@ -1,0 +1,170 @@
+.TH GIT-UPDATER 1 "August 2026" "0.1.0" "User Commands"
+.SH NAME
+git-updater \- Track git repos, pin commits, export vendor.lock, replicate stacks.
+.SH SYNOPSIS
+.B git-updater
+[\fIOPTIONS\fR]
+\fICOMMAND\fR
+[\fIARGS\fR]
+.SH DESCRIPTION
+Track git repos, pin commits, export vendor.lock, replicate stacks.
+
+Machine-readable help:
+.P
+.B git-updater --help-json
+.SH OPTIONS
+.TP
+.B --no-self-check
+Skip automatic self-update check after command (default: False)
+.TP
+.B --help-json
+Print machine-readable CLI spec as JSON and exit (default: False)
+.SH COMMANDS
+.TP
+.B init
+First-run setup: catalog, pip -e this clone, skills, adopt self, replicate shared.lock
+.br
+--root  Clone root (default: cwd; if cwd is this checkout, its parent)
+.br
+--force  Overwrite existing catalog
+.br
+--lock  Replicate this lock after init (default: examples/shared.lock if present)
+.br
+--no-lock  Skip stack lock replicate
+.br
+--no-pip  Skip pip install -e of this checkout
+.TP
+.B scan
+List git repos under root not in catalog
+.TP
+.B add
+Clone and register a repo
+.br
+repo (required) owner/repo, any git URL (https/ssh), file:// path, or local folder
+.br
+--name  Catalog name (default: repo name)
+.br
+--path  Relative path under root
+.br
+--branch  Branch to clone (default: main)
+.br
+--install  Override install hook (default: read .git-updater.yaml from repo)
+.TP
+.B adopt
+Register an existing clone
+.br
+folder (required) Folder name or path under root
+.br
+--name  Catalog name
+.br
+--branch  Override branch
+.br
+--install  Override install hook (default: read .git-updater.yaml from repo)
+.TP
+.B sync-hooks
+Refresh install/update hooks from each repo's .git-updater manifest
+.br
+name (optional) Single repo
+.TP
+.B rm
+Remove from catalog (keeps folder)
+.br
+name (required) Catalog name
+.TP
+.B status
+Show pin status
+.br
+name (optional) Single repo
+.br
+--fetch  Fetch before comparing remote
+.TP
+.B pin
+Pin catalog to current HEAD
+.br
+name (optional) Single repo
+.br
+--export  Also write vendor.lock
+.TP
+.B install
+Clone missing repos and run install hooks
+.br
+name (optional) Single repo
+.TP
+.B update
+Fetch and fast-forward clean repos
+.br
+name (optional) Single repo
+.TP
+.B consolidate
+Fetch and merge/rebase when update would fail; resolve conflicts stepwise
+.br
+name (optional) Single repo
+.br
+--rebase  Use rebase instead of merge when not fast-forwardable
+.br
+--continue  Continue after you fixed merge/rebase conflicts
+.br
+--abort  Abort an in-progress merge or rebase
+.TP
+.B push
+Push tracking branch
+.br
+name (optional) Single repo
+.TP
+.B export
+Write vendor.lock and VENDOR.md
+.br
+--out  Lock file path (default: <root>/vendor.lock)
+.TP
+.B replicate
+Bootstrap stack from vendor.lock
+.br
+lockfile (required) Path to vendor.lock
+.br
+--root  Clone root on this machine (default: directory that contains the lockfile)
+.br
+--dry-run  Print actions without cloning
+.TP
+.B verify
+Check clones match lock (exit 1 on drift)
+.br
+--lock  Lock file (default: <root>/vendor.lock)
+.br
+--root  Override root
+.TP
+.B self-check
+Check whether git-updater itself is up to date
+.br
+--fetch  Fetch from origin / GitHub before comparing (bypasses 24h cache)
+.br
+--json  Also print machine-readable result
+.TP
+.B self-update
+Fast-forward git-updater to latest upstream
+.TP
+.B install-skills
+Copy the git-updater agent skill to ~/.cursor/skills and ~/.agents/skills
+.TP
+.B help
+Show help; --json for the machine-readable spec
+.br
+topic (optional) Command name
+.br
+--json  Print CLI spec as JSON
+.TP
+.B man
+Print man page (roff) to stdout
+.br
+--write  Write roff to this file instead of stdout
+.SH FILES
+~/.git-updater/catalog.json
+.br
+Machine-local catalog (clone root, pins).
+.br
+<clone-root>/vendor.lock
+.br
+Shareable SHA pins (relative paths only).
+.SH EXIT STATUS
+0 on success. Non-zero on error, verify drift, or self-check behind/dirty/diverged.
+.SH SEE ALSO
+git-updater --help, git-updater --help-json, git-updater man
