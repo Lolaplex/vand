@@ -15,7 +15,7 @@ Machine-readable help:
 .SH OPTIONS
 .TP
 .B --no-self-check
-Skip automatic self-update check after command (default: False)
+Skip automatic self-update after update/install/replicate/consolidate (default: False)
 .TP
 .B --help-json
 Print machine-readable CLI spec as JSON and exit (default: False)
@@ -140,7 +140,7 @@ Check whether git-updater itself is up to date
 --json  Also print machine-readable result
 .TP
 .B self-update
-Fast-forward git-updater to latest upstream
+Fast-forward git-updater from descendant remotes and reinstall
 .TP
 .B install-skills
 Copy the git-updater agent skill to ~/.cursor/skills and ~/.agents/skills

@@ -91,7 +91,7 @@ verify: python -m unittest discover -s tests -v
 
 Different remotes are allowed. Identity is the **commit SHA**, not the GitHub repo name.
 
-`mirrors` in the lock are extra fetch URLs for that pin. `replicate` / `install` fetch origin, `url`, and mirrors until the SHA exists, then check out that SHA. `update` / `push` still use `origin`.
+`update` / `push` still use `origin`. `self-update` may fast-forward another configured remote only if `HEAD` is an ancestor of that remote's branch tip (same history, extra commits). It then runs the update hook (`pip install -e .`) so PATH stays on this checkout.
 
 A personal fork and an org copy (`you/app` vs `Lolaplex/app`) are not the same project just because the name matches. Add the org remote (or set origin to it) so the pin can be fetched:
 
