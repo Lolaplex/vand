@@ -1,0 +1,5 @@
+# Machine-readable hooks for git-updater (and humans who refuse README install steps).
+version: 1
+install: python -m unittest discover -s tests -v
+update: python -m unittest discover -s tests -v
+verify: python -m unittest discover -s tests -v
