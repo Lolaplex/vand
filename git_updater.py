@@ -25,6 +25,7 @@ LOG_DIR = CONFIG_DIR / "logs"
 SELF_CHECK_CACHE = CONFIG_DIR / "self-check.json"
 SELF_CHECK_TTL_SECS = 24 * 60 * 60
 SKIP_SELF_CHECK_COMMANDS = frozenset({"self-check", "self-update", "init"})
+AUTO_SELF_UPDATE_COMMANDS = frozenset({"update", "install", "replicate", "consolidate"})
 
 MANIFEST_FILENAMES = (
     ".git-updater.json",
@@ -184,6 +185,7 @@ class SelfCheckResult:
     behind: int = 0
     source: str = "git"
     message: str = ""
+    sync_ref: str | None = None
 
 
 def github_api_json(url: str) -> dict[str, Any] | None:
@@ -246,6 +248,7 @@ def save_self_check_cache(result: SelfCheckResult) -> None:
         "ahead": result.ahead,
         "behind": result.behind,
         "source": result.source,
+        "sync_ref": result.sync_ref,
     }
     SELF_CHECK_CACHE.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
@@ -285,6 +288,7 @@ def check_self(fetch: bool = True, use_cache: bool = True) -> SelfCheckResult:
                 behind=int(cached.get("behind", 0)),
                 source=cached.get("source", "cache"),
                 message="(cached)",
+                sync_ref=cached.get("sync_ref"),
             )
 
     local_commit: str | None = None
@@ -293,33 +297,54 @@ def check_self(fetch: bool = True, use_cache: bool = True) -> SelfCheckResult:
     ahead = behind = 0
     source = "git"
     status = "unknown"
+    sync_ref: str | None = None
 
     if (root / ".git").exists():
         if fetch:
-            run_git(root, "fetch", "origin", check=False)
+            fetch_all_remotes(root)
         local_commit = current_commit(root)
         branch = current_branch(root)
         if is_dirty(root):
             status = "dirty"
         elif branch:
-            try:
-                remote_ref = run_git(root, "rev-parse", f"origin/{branch}")
-                remote_commit = remote_ref.stdout.strip()
-            except subprocess.CalledProcessError:
-                remote_commit = None
-            if local_commit and remote_commit:
-                ahead, behind = ahead_behind(root, branch)
-                if ahead and behind:
-                    status = "diverged"
-                elif behind:
-                    status = "behind"
-                elif ahead:
+            names = self_remote_names(root)
+            ref, sync = pick_sync_ref(root, branch, names)
+            if sync == "behind" and ref:
+                status = "behind"
+                sync_ref = ref
+                remote_commit = parse_rev(root, ref)
+                remote_name = remote_from_sync_ref(ref, branch)
+                if remote_name:
+                    ahead, behind = remote_ahead_behind(root, branch, remote_name)
+            elif sync == "diverged":
+                status = "diverged"
+                if "origin" in names:
+                    ahead, behind = remote_ahead_behind(root, branch, "origin")
+                    remote_commit = parse_rev(root, f"origin/{branch}")
+            elif "origin" in names:
+                origin_ahead, _origin_behind = remote_ahead_behind(
+                    root, branch, "origin"
+                )
+                remote_commit = parse_rev(root, f"origin/{branch}")
+                if origin_ahead:
                     status = "ahead"
-                elif local_commit == remote_commit:
+                    ahead = origin_ahead
+                elif local_commit and remote_commit:
+                    status = (
+                        "up-to-date" if local_commit == remote_commit else "unpinned"
+                    )
+                elif local_commit:
                     status = "up-to-date"
-                else:
-                    status = "unpinned"
-            elif local_commit and not remote_commit:
+                    remote_commit = local_commit
+            elif names:
+                remote_commit = parse_rev(root, f"{names[0]}/{branch}")
+                if local_commit and remote_commit:
+                    status = (
+                        "up-to-date" if local_commit == remote_commit else "unpinned"
+                    )
+                elif local_commit:
+                    status = "up-to-date"
+            elif local_commit:
                 source = "github-api"
                 origin_info = read_origin(root)
                 if can_use_github_api(remote, origin_info[1] if origin_info else None):
@@ -364,6 +389,7 @@ def check_self(fetch: bool = True, use_cache: bool = True) -> SelfCheckResult:
         ahead=ahead,
         behind=behind,
         source=source,
+        sync_ref=sync_ref,
     )
     save_self_check_cache(result)
     return result
@@ -421,6 +447,98 @@ def maybe_warn_self_update() -> None:
             f"Run: git-updater self-check --fetch  |  git-updater self-update",
             file=sys.stderr,
         )
+
+
+def apply_self_update(*, interactive: bool = True) -> SelfCheckResult:
+    """Fast-forward this checkout from same-project remotes, then reinstall."""
+    root = install_root()
+    if not (root / ".git").exists():
+        message = "git-updater is not a git checkout - clone from GitHub to self-update."
+        if interactive:
+            raise SystemExit(message)
+        return check_self(fetch=False, use_cache=True)
+
+    result = check_self(fetch=True, use_cache=False)
+    if interactive:
+        print(format_self_check(result))
+    if result.status == "up-to-date":
+        _pin_catalog_self(root, result.branch)
+        return result
+
+    refuse = {
+        "dirty": "Refusing to self-update: working tree has local changes.",
+        "diverged": "Refusing to self-update: diverged from upstream.",
+        "unknown": "Could not determine upstream state.",
+        "ahead": "Local git-updater is ahead of upstream - not pulling.",
+        "no-local-git": "git-updater is not a git checkout - clone from GitHub to self-update.",
+    }
+    if result.status != "behind":
+        message = refuse.get(
+            result.status, f"Cannot self-update (status: {result.status})."
+        )
+        if interactive:
+            raise SystemExit(message)
+        if result.status in ("dirty", "diverged"):
+            print(
+                f"\nNote: git-updater {result.status} - skip self-update.",
+                file=sys.stderr,
+            )
+        return result
+
+    if is_dirty(root):
+        message = "Refusing to self-update: working tree has local changes."
+        if interactive:
+            raise SystemExit(message)
+        print(f"\nNote: {message}", file=sys.stderr)
+        return result
+
+    branch = result.branch or current_branch(root) or "main"
+    ref = result.sync_ref or f"origin/{branch}"
+    print(f"-> git-updater (self)")
+    print(f"  git merge --ff-only {ref}")
+    try:
+        run_git(root, "merge", "--ff-only", ref)
+    except subprocess.CalledProcessError as exc:
+        message = f"self-update fast-forward failed ({ref})"
+        if interactive:
+            raise SystemExit(message) from exc
+        print(f"Note: {message}", file=sys.stderr)
+        return result
+
+    new_head = current_commit(root)
+    old = result.local_commit[:7] if result.local_commit else "?"
+    if new_head:
+        print(f"  fast-forward {old} -> {new_head[:7]} ({ref})")
+
+    entry = self_hook_entry(root)
+    if resolve_hook_command(entry, root, "update")[0]:
+        run_update_hook(entry, root)
+
+    _pin_catalog_self(root, result.branch, new_head)
+    return check_self(fetch=False, use_cache=False)
+
+
+def _pin_catalog_self(
+    root: Path, branch: str | None, commit: str | None = None
+) -> None:
+    pair = catalog_self_entry()
+    if not pair:
+        return
+    catalog, catalog_entry = pair
+    head = commit or current_commit(root)
+    if not head or catalog_entry.commit == head:
+        return
+    catalog_entry.commit = head
+    if branch:
+        catalog_entry.branch = branch
+    save_catalog(catalog)
+    print(f"  catalog pin {catalog_entry.name} -> {head[:7]}")
+
+
+def maybe_apply_self_update() -> None:
+    if os.environ.get("GIT_UPDATER_SKIP_SELF_CHECK") == "1":
+        return
+    apply_self_update(interactive=False)
 
 
 def run_git(
@@ -692,6 +810,81 @@ def same_project_remote_names(path: Path, entry: RepoEntry) -> list[str]:
     if "origin" in existing:
         return ["origin"]
     return existing[:1]
+
+
+def self_remote_names(path: Path) -> list[str]:
+    """Fetch remotes that belong to this git-updater checkout (any GitHub owner)."""
+    remotes = list_remotes(path)
+    origin = read_origin(path)
+    names: list[str] = []
+    for name, url, rid in remotes:
+        if origin and same_github_project(origin[0], rid, origin[1], url):
+            names.append(name)
+            continue
+        parts = github_owner_repo(rid, url)
+        if parts and parts[1] == "git-updater":
+            names.append(name)
+    if names:
+        return names
+    existing = [name for name, _, _ in remotes]
+    if "origin" in existing:
+        return ["origin"]
+    return existing[:1]
+
+
+def remote_from_sync_ref(ref: str, branch: str) -> str | None:
+    suffix = f"/{branch}"
+    if ref.endswith(suffix) and len(ref) > len(suffix):
+        return ref[: -len(suffix)]
+    return None
+
+
+def parse_rev(path: Path, ref: str) -> str | None:
+    result = run_git(path, "rev-parse", "--verify", ref, check=False)
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
+
+
+def self_hook_entry(root: Path) -> RepoEntry:
+    origin = read_origin(root)
+    remote, url = origin if origin else ("", "")
+    return RepoEntry(
+        name="git-updater",
+        remote=remote or "git-updater",
+        url=url,
+        path=str(root),
+        branch=current_branch(root) or "main",
+        commit=current_commit(root) or "",
+    )
+
+
+def catalog_self_entry() -> tuple[Catalog, RepoEntry] | None:
+    if not CATALOG_PATH.exists():
+        return None
+    try:
+        catalog = load_catalog()
+    except (OSError, json.JSONDecodeError, KeyError, SystemExit):
+        return None
+    root = install_root().resolve()
+    for entry in catalog.repos:
+        if repo_abs_path(catalog, entry).resolve() == root:
+            return catalog, entry
+    return None
+
+
+def is_self_checkout(catalog: Catalog, entry: RepoEntry) -> bool:
+    return repo_abs_path(catalog, entry).resolve() == install_root().resolve()
+
+
+def should_defer_self(args: argparse.Namespace, catalog: Catalog, entry: RepoEntry) -> bool:
+    """Skip catalog git-updater during bulk update; self-update runs after."""
+    if getattr(args, "name", None):
+        return False
+    if getattr(args, "no_self_check", False):
+        return False
+    return is_self_checkout(catalog, entry)
 
 
 def fetch_all_remotes(path: Path, extra_urls: list[str] | None = None) -> None:
@@ -1618,6 +1811,9 @@ def cmd_update(args: argparse.Namespace) -> None:
     log_lines: list[str] = []
     for entry in repos:
         path = repo_abs_path(catalog, entry)
+        if should_defer_self(args, catalog, entry):
+            print(f"-> {entry.name} (self-update at end)")
+            continue
         print(f"-> {entry.name}")
         if not path.exists():
             print(f"  missing - run install")
@@ -1754,30 +1950,7 @@ def cmd_self_check(args: argparse.Namespace) -> None:
 
 
 def cmd_self_update(args: argparse.Namespace) -> None:
-    root = install_root()
-    if not (root / ".git").exists():
-        raise SystemExit(
-            "git-updater is not a git checkout - clone from GitHub to self-update."
-        )
-    result = check_self(fetch=True, use_cache=False)
-    print(format_self_check(result))
-    if result.status == "up-to-date":
-        return
-    if result.status == "dirty":
-        raise SystemExit("Refusing to self-update: working tree has local changes.")
-    if result.status == "diverged":
-        raise SystemExit("Refusing to self-update: diverged from upstream.")
-    if result.status == "unknown":
-        raise SystemExit("Could not determine upstream state.")
-    branch = result.branch or current_branch(root) or "main"
-    if is_dirty(root):
-        raise SystemExit("Refusing to self-update: working tree has local changes.")
-    print(f"-> git pull --ff-only origin {branch}")
-    run_git(root, "pull", "--ff-only", "origin", branch)
-    new_head = current_commit(root)
-    if new_head:
-        print(f"Updated to {new_head[:7]}")
-    check_self(fetch=False, use_cache=False)
+    apply_self_update(interactive=True)
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
@@ -1823,7 +1996,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-self-check",
         action="store_true",
-        help="Skip automatic self-update check after command",
+        help="Skip automatic self-update after update/install/replicate/consolidate",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1946,7 +2119,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="Also print machine-readable result")
     p.set_defaults(func=cmd_self_check)
 
-    p = sub.add_parser("self-update", help="Fast-forward git-updater to latest upstream")
+    p = sub.add_parser(
+        "self-update",
+        help="Fast-forward git-updater from same-project remotes and reinstall",
+    )
     p.set_defaults(func=cmd_self_update)
 
     return parser
@@ -1956,10 +2132,11 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     args.func(args)
-    if (
-        not args.no_self_check
-        and args.command not in SKIP_SELF_CHECK_COMMANDS
-    ):
+    if args.no_self_check or args.command in SKIP_SELF_CHECK_COMMANDS:
+        return
+    if args.command in AUTO_SELF_UPDATE_COMMANDS:
+        maybe_apply_self_update()
+    else:
         maybe_warn_self_update()
 
 

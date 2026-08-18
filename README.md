@@ -188,9 +188,9 @@ See [`git-updater.schema.json`](git-updater.schema.json) for the JSON shape.
 | `replicate LOCK [--root PATH] [--dry-run]` | Bootstrap from lock |
 | `verify [--lock PATH]` | Drift check |
 | `self-check [--fetch] [--json]` | Check if git-updater itself is up to date |
-| `self-update` | Fast-forward git-updater from upstream |
+| `self-update` | Fast-forward git-updater (all same-project remotes) + reinstall |
 
-Global: `--no-self-check` skips the automatic post-command update hint.
+Global: `--no-self-check` skips automatic self-update after `update` / `install` / `replicate` / `consolidate` (other commands still skip the hint).
 
 ## vendor.lock format (v1)
 
@@ -235,21 +235,23 @@ Example future job:
 python -m unittest discover -s tests -v
 ```
 
-## Self-update check
+## Self-update
 
-git-updater checks whether **itself** is behind **this checkout's `origin`**:
+git-updater keeps **itself** current from this checkout's remotes (personal `origin` + org mirror both count, same as other repos):
 
 ```powershell
 git-updater self-check              # uses 24h cache when offline-friendly
-git-updater self-check --fetch        # force fresh compare with origin / GitHub API
-git-updater self-update               # git pull --ff-only (git checkout only)
+git-updater self-check --fetch        # force fresh compare
+git-updater self-update               # ff-only + `python -m pip install -e .`
 ```
 
-After most commands, a one-line note appears if an update is available (disable with `--no-self-check` or `GIT_UPDATER_SKIP_SELF_CHECK=1`).
+After `update` / `install` / `replicate` / `consolidate`, self-update runs automatically if the checkout is clean and behind. Dirty or diverged trees are left alone. Disable with `--no-self-check` or `GIT_UPDATER_SKIP_SELF_CHECK=1`.
+
+Other commands still print a one-line hint when an update is cached as available.
 
 Detection order:
 
-1. If `git_updater.py` lives in a git clone: compare `HEAD` to `origin/<branch>`
+1. If `git_updater.py` lives in a git clone: compare `HEAD` to same-project remotes (`origin` + GitHub mirrors named `git-updater`)
 2. Else if `origin` is a GitHub `owner/repo` URL: GitHub API
 3. Otherwise: unknown (no hardcoded upstream)
 

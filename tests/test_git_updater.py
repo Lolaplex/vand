@@ -369,43 +369,134 @@ class SelfCheckTests(unittest.TestCase):
         self.assertIn("self-update", text)
 
     @mock.patch("git_updater.save_self_check_cache")
-    @mock.patch("git_updater.github_remote_tip", return_value=("main", "b" * 40))
+    @mock.patch("git_updater.parse_rev", return_value="b" * 40)
+    @mock.patch("git_updater.remote_ahead_behind", return_value=(0, 3))
+    @mock.patch("git_updater.pick_sync_ref", return_value=("origin/main", "behind"))
+    @mock.patch("git_updater.self_remote_names", return_value=["origin"])
+    @mock.patch("git_updater.fetch_all_remotes")
     @mock.patch("git_updater.current_commit", return_value="a" * 40)
     @mock.patch("git_updater.current_branch", return_value="main")
     @mock.patch("git_updater.is_dirty", return_value=False)
-    @mock.patch("git_updater.run_git")
     @mock.patch("git_updater.install_root")
     def test_check_self_git_behind(
         self,
         mock_root: mock.Mock,
-        mock_run_git: mock.Mock,
         *_m: mock.Mock,
     ) -> None:
         root = Path("/tmp/git-updater")
         mock_root.return_value = root
         with mock.patch.object(Path, "exists", return_value=True):
-            def git_side_effect(path: Path | None, *args: str, **kwargs: object):
-                cmd = mock.Mock()
-                if args == ("rev-parse", "origin/main"):
-                    cmd.stdout = "b" * 40 + "\n"
-                elif args == ("rev-list", "--left-right", "--count", "HEAD...origin/main"):
-                    cmd.stdout = "0\t3\n"
-                else:
-                    cmd.stdout = ""
-                return cmd
-
-            mock_run_git.side_effect = git_side_effect
-            with mock.patch("git_updater.read_origin", return_value=("acme/git-updater", "url")):
+            with mock.patch(
+                "git_updater.read_origin", return_value=("acme/git-updater", "url")
+            ):
                 with mock.patch("git_updater.load_self_check_cache", return_value=None):
                     result = gu.check_self(fetch=True, use_cache=False)
         self.assertEqual(result.status, "behind")
         self.assertEqual(result.behind, 3)
+        self.assertEqual(result.sync_ref, "origin/main")
 
     @mock.patch.dict(os.environ, {"GIT_UPDATER_SKIP_SELF_CHECK": "1"})
     @mock.patch("git_updater.check_self")
     def test_maybe_warn_respects_skip_env(self, mock_check: mock.Mock) -> None:
         gu.maybe_warn_self_update()
         mock_check.assert_not_called()
+
+    def test_self_remote_names_includes_org_mirror(self) -> None:
+        with mock.patch(
+            "git_updater.list_remotes",
+            return_value=[
+                (
+                    "origin",
+                    "https://github.com/Klix927/git-updater.git",
+                    "Klix927/git-updater",
+                ),
+                (
+                    "lolaplex",
+                    "https://github.com/Lolaplex/git-updater.git",
+                    "Lolaplex/git-updater",
+                ),
+            ],
+        ):
+            with mock.patch(
+                "git_updater.read_origin",
+                return_value=(
+                    "Klix927/git-updater",
+                    "https://github.com/Klix927/git-updater.git",
+                ),
+            ):
+                names = gu.self_remote_names(Path("/tmp/git-updater"))
+        self.assertEqual(names, ["origin", "lolaplex"])
+
+    def test_remote_from_sync_ref(self) -> None:
+        self.assertEqual(gu.remote_from_sync_ref("lolaplex/main", "main"), "lolaplex")
+        self.assertEqual(
+            gu.remote_from_sync_ref("origin/feat/x", "feat/x"), "origin"
+        )
+
+    @mock.patch("git_updater.check_self")
+    @mock.patch("git_updater.run_update_hook")
+    @mock.patch(
+        "git_updater.resolve_hook_command",
+        return_value=("python -m pip install -e .", "manifest"),
+    )
+    @mock.patch("git_updater.catalog_self_entry", return_value=None)
+    @mock.patch("git_updater.self_hook_entry")
+    @mock.patch("git_updater.current_commit", return_value="b" * 40)
+    @mock.patch("git_updater.run_git")
+    @mock.patch("git_updater.is_dirty", return_value=False)
+    @mock.patch("git_updater.install_root")
+    def test_apply_self_update_ff_and_hook(
+        self,
+        mock_root: mock.Mock,
+        _dirty: mock.Mock,
+        mock_run: mock.Mock,
+        _head: mock.Mock,
+        mock_entry: mock.Mock,
+        _catalog: mock.Mock,
+        _resolve: mock.Mock,
+        mock_hook: mock.Mock,
+        mock_check: mock.Mock,
+    ) -> None:
+        root = Path("/tmp/git-updater")
+        mock_root.return_value = root
+        mock_entry.return_value = gu.RepoEntry(
+            name="git-updater",
+            remote="acme/git-updater",
+            url="https://github.com/acme/git-updater.git",
+            path=str(root),
+            branch="main",
+            commit="a" * 40,
+        )
+        behind = gu.SelfCheckResult(
+            install_path=root,
+            remote="acme/git-updater",
+            branch="main",
+            local_commit="a" * 40,
+            remote_commit="b" * 40,
+            status="behind",
+            behind=1,
+            sync_ref="lolaplex/main",
+        )
+        done = gu.SelfCheckResult(
+            install_path=root,
+            remote="acme/git-updater",
+            branch="main",
+            local_commit="b" * 40,
+            remote_commit="b" * 40,
+            status="up-to-date",
+        )
+        mock_check.side_effect = [behind, done]
+        with mock.patch.object(Path, "exists", return_value=True):
+            result = gu.apply_self_update(interactive=True)
+        mock_run.assert_called_with(root, "merge", "--ff-only", "lolaplex/main")
+        mock_hook.assert_called_once()
+        self.assertEqual(result.status, "up-to-date")
+
+    @mock.patch.dict(os.environ, {"GIT_UPDATER_SKIP_SELF_CHECK": "1"})
+    @mock.patch("git_updater.apply_self_update")
+    def test_maybe_apply_respects_skip_env(self, mock_apply: mock.Mock) -> None:
+        gu.maybe_apply_self_update()
+        mock_apply.assert_not_called()
 
 
 class GithubProjectIdentityTests(unittest.TestCase):
