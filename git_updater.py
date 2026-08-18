@@ -1,0 +1,1688 @@
+#!/usr/bin/env python3
+"""Git vendor tracker — catalog, vendor.lock, replicate."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+
+CATALOG_VERSION = 1
+LOCK_VERSION = 1
+CONFIG_DIR = Path.home() / ".git-updater"
+CATALOG_PATH = CONFIG_DIR / "catalog.json"
+LOG_DIR = CONFIG_DIR / "logs"
+SELF_CHECK_CACHE = CONFIG_DIR / "self-check.json"
+SELF_CHECK_TTL_SECS = 24 * 60 * 60
+SELF_GITHUB_DEFAULT = "Cypoe/git-updater"
+SKIP_SELF_CHECK_COMMANDS = frozenset({"self-check", "self-update", "init"})
+
+MANIFEST_FILENAMES = (
+    ".git-updater.json",
+    "git-updater.json",
+    ".git-updater.yaml",
+    "git-updater.yaml",
+    ".git-updater.yml",
+    "git-updater.yml",
+)
+
+GITHUB_RE = re.compile(
+    r"(?:github\.com[/:]|git@github\.com:)([^/]+)/([^/\s]+?)(?:\.git)?/?$"
+)
+
+
+@dataclass
+class RepoEntry:
+    name: str
+    remote: str
+    url: str
+    path: str
+    branch: str
+    commit: str
+    install: str | None = None
+    update: str | None = None
+
+    @property
+    def github(self) -> str:
+        """Backward-compatible alias; same as remote id."""
+        return self.remote
+
+    def to_dict(self) -> dict[str, Any]:
+        d = {
+            "name": self.name,
+            "remote": self.remote,
+            "github": self.remote,
+            "url": self.url,
+            "path": self.path,
+            "branch": self.branch,
+            "commit": self.commit,
+        }
+        if self.install is not None:
+            d["install"] = self.install
+        if self.update is not None:
+            d["update"] = self.update
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RepoEntry:
+        remote = data.get("remote") or data.get("github") or data.get("url", "?")
+        return cls(
+            name=data["name"],
+            remote=remote,
+            url=data["url"],
+            path=data["path"],
+            branch=data["branch"],
+            commit=data["commit"],
+            install=data.get("install"),
+            update=data.get("update"),
+        )
+
+
+@dataclass
+class Catalog:
+    version: int
+    root: str
+    repos: list[RepoEntry] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "root": self.root,
+            "repos": [r.to_dict() for r in self.repos],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Catalog:
+        return cls(
+            version=data.get("version", 1),
+            root=data["root"],
+            repos=[RepoEntry.from_dict(r) for r in data.get("repos", [])],
+        )
+
+    def find(self, name: str) -> RepoEntry | None:
+        for repo in self.repos:
+            if repo.name == name:
+                return repo
+        return None
+
+    def remove(self, name: str) -> bool:
+        before = len(self.repos)
+        self.repos = [r for r in self.repos if r.name != name]
+        return len(self.repos) < before
+
+
+def normalize_path(path: str | Path) -> str:
+    return str(Path(path).resolve()).replace("\\", "/")
+
+
+def ensure_config_dir() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_catalog() -> Catalog:
+    if not CATALOG_PATH.exists():
+        raise SystemExit(
+            f"No catalog at {CATALOG_PATH}. Run: git-updater init --root <path>"
+        )
+    data = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+    return Catalog.from_dict(data)
+
+
+def save_catalog(catalog: Catalog) -> None:
+    ensure_config_dir()
+    CATALOG_PATH.write_text(
+        json.dumps(catalog.to_dict(), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def write_log(command: str, lines: list[str]) -> Path:
+    ensure_config_dir()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = LOG_DIR / f"{stamp}-{command}.log"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def install_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def resolve_self_remote(install_path: Path | None = None) -> str:
+    root = install_path or install_root()
+    origin = read_origin(root)
+    if origin:
+        return origin[0]
+    return SELF_GITHUB_DEFAULT
+
+
+@dataclass
+class SelfCheckResult:
+    install_path: Path
+    remote: str
+    branch: str | None
+    local_commit: str | None
+    remote_commit: str | None
+    status: str
+    ahead: int = 0
+    behind: int = 0
+    source: str = "git"
+    message: str = ""
+
+
+def github_api_json(url: str) -> dict[str, Any] | None:
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "git-updater",
+        },
+    )
+    try:
+        with urlopen(request, timeout=15) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+        return None
+
+
+def github_remote_tip(github: str, branch: str | None = None) -> tuple[str, str] | None:
+    owner, repo = github.split("/", 1)
+    if not branch:
+        meta = github_api_json(f"https://api.github.com/repos/{owner}/{repo}")
+        if not meta:
+            return None
+        branch = meta.get("default_branch") or "main"
+    commit_data = github_api_json(
+        f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}"
+    )
+    if not commit_data:
+        return None
+    sha = commit_data.get("sha")
+    if not sha:
+        return None
+    return branch, sha
+
+
+def load_self_check_cache() -> dict[str, Any] | None:
+    if not SELF_CHECK_CACHE.exists():
+        return None
+    try:
+        return json.loads(SELF_CHECK_CACHE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def save_self_check_cache(result: SelfCheckResult) -> None:
+    ensure_config_dir()
+    payload = {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "install_path": normalize_path(result.install_path),
+        "remote": result.remote,
+        "github": result.remote,
+        "branch": result.branch,
+        "local_commit": result.local_commit,
+        "remote_commit": result.remote_commit,
+        "status": result.status,
+        "ahead": result.ahead,
+        "behind": result.behind,
+        "source": result.source,
+    }
+    SELF_CHECK_CACHE.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def cache_is_fresh(cache: dict[str, Any], fetch: bool) -> bool:
+    if fetch:
+        return False
+    checked_at = cache.get("checked_at")
+    if not checked_at:
+        return False
+    try:
+        ts = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    age = datetime.now(timezone.utc) - ts.astimezone(timezone.utc)
+    return age.total_seconds() < SELF_CHECK_TTL_SECS
+
+
+def check_self(fetch: bool = True, use_cache: bool = True) -> SelfCheckResult:
+    root = install_root()
+    remote = resolve_self_remote(root)
+    cached = load_self_check_cache() if use_cache else None
+    if cached and cache_is_fresh(cached, fetch):
+        if cached.get("install_path") == normalize_path(root):
+            cached_remote = cached.get("remote") or cached.get("github", remote)
+            return SelfCheckResult(
+                install_path=root,
+                remote=cached_remote,
+                branch=cached.get("branch"),
+                local_commit=cached.get("local_commit"),
+                remote_commit=cached.get("remote_commit"),
+                status=cached.get("status", "unknown"),
+                ahead=int(cached.get("ahead", 0)),
+                behind=int(cached.get("behind", 0)),
+                source=cached.get("source", "cache"),
+                message="(cached)",
+            )
+
+    local_commit: str | None = None
+    branch: str | None = None
+    remote_commit: str | None = None
+    ahead = behind = 0
+    source = "git"
+    status = "unknown"
+
+    if (root / ".git").exists():
+        if fetch:
+            run_git(root, "fetch", "origin", check=False)
+        local_commit = current_commit(root)
+        branch = current_branch(root)
+        if is_dirty(root):
+            status = "dirty"
+        elif branch:
+            try:
+                remote_ref = run_git(root, "rev-parse", f"origin/{branch}")
+                remote_commit = remote_ref.stdout.strip()
+            except subprocess.CalledProcessError:
+                remote_commit = None
+            if local_commit and remote_commit:
+                ahead, behind = ahead_behind(root, branch)
+                if ahead and behind:
+                    status = "diverged"
+                elif behind:
+                    status = "behind"
+                elif ahead:
+                    status = "ahead"
+                elif local_commit == remote_commit:
+                    status = "up-to-date"
+                else:
+                    status = "unpinned"
+            elif local_commit and not remote_commit:
+                source = "github-api"
+                origin_info = read_origin(root)
+                if can_use_github_api(remote, origin_info[1] if origin_info else None):
+                    tip = github_remote_tip(remote, branch)
+                else:
+                    tip = None
+                if tip:
+                    branch, remote_commit = tip
+                    status = "behind" if local_commit != remote_commit else "up-to-date"
+                    behind = 0 if status == "up-to-date" else 1
+        elif local_commit:
+            source = "github-api"
+            origin = read_origin(root)
+            if can_use_github_api(remote, origin[1] if origin else None):
+                tip = github_remote_tip(remote)
+            else:
+                tip = None
+            if tip:
+                branch, remote_commit = tip
+                status = "behind" if local_commit != remote_commit else "up-to-date"
+                behind = 0 if status == "up-to-date" else 1
+    else:
+        source = "github-api"
+        origin = read_origin(root)
+        if can_use_github_api(remote, origin[1] if origin else None):
+            tip = github_remote_tip(remote)
+        else:
+            tip = None
+        if tip:
+            branch, remote_commit = tip
+            status = "no-local-git"
+        else:
+            status = "unknown"
+
+    result = SelfCheckResult(
+        install_path=root,
+        remote=remote,
+        branch=branch,
+        local_commit=local_commit,
+        remote_commit=remote_commit,
+        status=status,
+        ahead=ahead,
+        behind=behind,
+        source=source,
+    )
+    save_self_check_cache(result)
+    return result
+
+
+def remote_display_url(remote_id: str) -> str:
+    if remote_id.startswith("local:"):
+        return remote_id.removeprefix("local:")
+    if "/" in remote_id and not remote_id.startswith("local:"):
+        if remote_id.count("/") == 1 and not remote_id.startswith("http"):
+            return f"https://github.com/{remote_id}"
+    return remote_id
+
+
+def format_self_check(result: SelfCheckResult, verbose: bool = True) -> str:
+    local = result.local_commit[:7] if result.local_commit else "n/a"
+    remote = result.remote_commit[:7] if result.remote_commit else "n/a"
+    upstream = remote_display_url(result.remote)
+    lines = [
+        f"git-updater install: {normalize_path(result.install_path)}",
+        f"upstream: {upstream}" + (f" ({result.branch})" if result.branch else ""),
+        f"local:  {local}   remote: {remote}   status: {result.status}",
+    ]
+    if result.status == "behind":
+        detail = f"{result.behind} commit(s) behind" if result.behind else "update available"
+        lines.append(f"-> {detail}. Run: git-updater self-update")
+    elif result.status == "dirty":
+        lines.append("-> local changes present - commit or stash before self-update")
+    elif result.status == "diverged":
+        lines.append("-> diverged from upstream - resolve manually, then self-update")
+    elif result.status == "no-local-git":
+        lines.append(
+            f"-> not a git checkout; remote tip is {remote}. Clone from GitHub to track updates."
+        )
+    elif result.status == "unknown":
+        lines.append("-> could not reach upstream (offline or repo not published yet)")
+    elif verbose and result.status == "up-to-date":
+        lines.append("-> up to date")
+    if result.message:
+        lines.append(result.message)
+    return "\n".join(lines)
+
+
+def maybe_warn_self_update() -> None:
+    if os.environ.get("GIT_UPDATER_SKIP_SELF_CHECK") == "1":
+        return
+    result = check_self(fetch=False, use_cache=True)
+    if result.status == "behind":
+        remote = result.remote_commit[:7] if result.remote_commit else "?"
+        local = result.local_commit[:7] if result.local_commit else "?"
+        print(
+            f"\nNote: git-updater update available ({local} -> {remote}). "
+            f"Run: git-updater self-check --fetch  |  git-updater self-update",
+            file=sys.stderr,
+        )
+
+
+def run_git(
+    repo_path: Path | None,
+    *args: str,
+    check: bool = True,
+    capture: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    cmd = ["git"]
+    if repo_path is not None:
+        cmd.extend(["-C", str(repo_path)])
+    cmd.extend(args)
+    return subprocess.run(
+        cmd,
+        check=check,
+        capture_output=capture,
+        text=True,
+    )
+
+
+def parse_github_remote(url: str) -> tuple[str, str] | None:
+    url = url.strip()
+    match = GITHUB_RE.search(url)
+    if match:
+        owner, repo = match.group(1), match.group(2)
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        return owner, repo
+    parsed = urlparse(url)
+    if parsed.netloc in ("github.com", "www.github.com"):
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) >= 2:
+            return parts[0], parts[1].removesuffix(".git")
+    return None
+
+
+def is_local_remote(url: str) -> bool:
+    url = url.strip()
+    if url.startswith("file:"):
+        return True
+    if re.match(r"^[A-Za-z]:[\\/]", url):
+        return True
+    if url.startswith("/"):
+        return True
+    path = Path(url)
+    return path.exists()
+
+
+def normalize_clone_url(url: str) -> str:
+    url = url.strip()
+    if url.startswith("file:"):
+        parsed = urlparse(url)
+        if parsed.netloc:
+            return normalize_path(f"{parsed.netloc}{parsed.path}")
+        return normalize_path(parsed.path)
+    if is_local_remote(url) and not url.startswith("file:"):
+        return normalize_path(url)
+    return url
+
+
+def remote_id_from_url(url: str) -> str:
+    url = normalize_clone_url(url)
+    parsed_github = parse_github_remote(url)
+    if parsed_github:
+        return github_slug(*parsed_github)
+    if is_local_remote(url):
+        return f"local:{normalize_path(url)}"
+    if url.startswith("git@"):
+        host_path = url.split("@", 1)[1]
+        if ":" in host_path:
+            host, repo_path = host_path.split(":", 1)
+            repo_path = repo_path.removesuffix(".git")
+            return f"{host}/{repo_path}"
+    parsed = urlparse(url)
+    if parsed.scheme in ("http", "https", "ssh", "git") and parsed.netloc:
+        parts = parsed.path.strip("/").removesuffix(".git")
+        if parts:
+            return f"{parsed.netloc}/{parts}"
+    return url
+
+
+def default_name_from_spec(spec: str, remote_id: str) -> str:
+    if remote_id.startswith("local:"):
+        return Path(remote_id.removeprefix("local:")).name
+    if "/" in remote_id:
+        return remote_id.rsplit("/", 1)[-1]
+    return Path(spec).name if spec else "repo"
+
+
+def github_slug(owner: str, repo: str) -> str:
+    return f"{owner}/{repo}"
+
+
+def canonical_clone_url(owner: str, repo: str) -> str:
+    return f"https://github.com/{owner}/{repo}.git"
+
+
+def parse_repo_spec(spec: str) -> tuple[str, str, str]:
+    """Return (default_name, remote_id, clone_url)."""
+    spec = spec.strip().rstrip("/")
+    if re.match(r"^[\w.-]+/[\w.-]+$", spec) and "://" not in spec and not spec.startswith("git@"):
+        owner, repo = spec.split("/", 1)
+        url = canonical_clone_url(owner, repo)
+        return repo, github_slug(owner, repo), url
+    if spec.startswith("git@") or "://" in spec or is_local_remote(spec):
+        url = normalize_clone_url(spec)
+        remote_id = remote_id_from_url(url)
+        name = default_name_from_spec(spec, remote_id)
+        return name, remote_id, url
+    raise ValueError(
+        f"Invalid repo spec: {spec} "
+        "(use owner/repo, https/ssh git URL, file:// path, or existing local path)"
+    )
+
+
+def repo_abs_path(catalog: Catalog, entry: RepoEntry) -> Path:
+    return Path(catalog.root) / entry.path
+
+
+def read_origin(entry_path: Path) -> tuple[str, str] | None:
+    if not (entry_path / ".git").exists():
+        return None
+    try:
+        result = run_git(entry_path, "remote", "get-url", "origin")
+    except subprocess.CalledProcessError:
+        return None
+    url = normalize_clone_url(result.stdout.strip())
+    return remote_id_from_url(url), url
+
+
+def current_branch(path: Path) -> str | None:
+    try:
+        result = run_git(path, "rev-parse", "--abbrev-ref", "HEAD")
+    except subprocess.CalledProcessError:
+        return None
+    branch = result.stdout.strip()
+    return None if branch == "HEAD" else branch
+
+
+def current_commit(path: Path) -> str | None:
+    try:
+        result = run_git(path, "rev-parse", "HEAD")
+    except subprocess.CalledProcessError:
+        return None
+    return result.stdout.strip()
+
+
+def is_dirty(path: Path) -> bool:
+    try:
+        result = run_git(path, "status", "--porcelain")
+    except subprocess.CalledProcessError:
+        return True
+    return bool(result.stdout.strip())
+
+
+def ahead_behind(path: Path, branch: str) -> tuple[int, int]:
+    try:
+        run_git(path, "fetch", "origin", branch, check=False)
+        result = run_git(
+            path,
+            "rev-list",
+            "--left-right",
+            "--count",
+            f"HEAD...origin/{branch}",
+        )
+    except subprocess.CalledProcessError:
+        return 0, 0
+    parts = result.stdout.strip().split()
+    if len(parts) != 2:
+        return 0, 0
+    ahead, behind = int(parts[0]), int(parts[1])
+    return ahead, behind
+
+
+def classify_repo(catalog: Catalog, entry: RepoEntry, fetch: bool = False) -> str:
+    path = repo_abs_path(catalog, entry)
+    if not path.exists() or not (path / ".git").exists():
+        return "missing"
+    if is_dirty(path):
+        return "dirty"
+    head = current_commit(path)
+    if not head:
+        return "missing"
+    if head != entry.commit:
+        branch = current_branch(path) or entry.branch
+        if fetch:
+            ahead, behind = ahead_behind(path, branch)
+        else:
+            ahead, behind = 0, 0
+        if ahead and behind:
+            return "diverged"
+        if ahead:
+            return "ahead"
+        if behind:
+            return "behind"
+        return "unpinned"
+    branch = current_branch(path) or entry.branch
+    if fetch:
+        ahead, behind = ahead_behind(path, branch)
+        if ahead and behind:
+            return "diverged"
+        if ahead:
+            return "ahead"
+        if behind:
+            return "behind"
+    return "pinned"
+
+
+def select_repos(catalog: Catalog, name: str | None) -> list[RepoEntry]:
+    if name:
+        entry = catalog.find(name)
+        if not entry:
+            raise SystemExit(f"Unknown repo: {name}")
+        return [entry]
+    return list(catalog.repos)
+
+
+def unique_name(catalog: Catalog, base: str) -> str:
+    if not catalog.find(base):
+        return base
+    i = 2
+    while catalog.find(f"{base}-{i}"):
+        i += 1
+    return f"{base}-{i}"
+
+
+def discover_git_dirs(root: Path) -> list[Path]:
+    found: list[Path] = []
+    if not root.exists():
+        return found
+    for dirpath, dirnames, _ in os.walk(root):
+        if ".git" in dirnames:
+            found.append(Path(dirpath))
+            dirnames[:] = [d for d in dirnames if d != ".git"]
+    return sorted(found)
+
+
+def catalog_paths(catalog: Catalog) -> set[str]:
+    root = Path(catalog.root).resolve()
+    return {(root / r.path).resolve().as_posix() for r in catalog.repos}
+
+
+def lock_from_catalog(catalog: Catalog) -> dict[str, Any]:
+    return {
+        "version": LOCK_VERSION,
+        "root": normalize_path(catalog.root),
+        "repos": [r.to_dict() for r in catalog.repos],
+    }
+
+
+def load_lock(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("version") != LOCK_VERSION:
+        raise SystemExit(f"Unsupported vendor.lock version: {data.get('version')}")
+    return data
+
+
+def save_lock(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def render_vendor_md(catalog: Catalog, exported_at: str | None = None) -> str:
+    ts = exported_at or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        "# Vendor log",
+        "",
+        f"Clone root: `{normalize_path(catalog.root)}`",
+        f"Exported: {ts}",
+        "",
+        "| Name | Remote | Branch | Commit | Install |",
+        "|------|--------|--------|--------|---------|",
+    ]
+    for repo in sorted(catalog.repos, key=lambda r: r.name):
+        short = repo.commit[:7] if len(repo.commit) >= 7 else repo.commit
+        install = repo.install or "-"
+        remote_cell = repo.remote
+        if repo.remote.count("/") == 1 and not repo.remote.startswith("local:"):
+            remote_cell = f"[{repo.remote}](https://github.com/{repo.remote})"
+        elif repo.remote.startswith("local:"):
+            remote_cell = f"`{repo.remote.removeprefix('local:')}`"
+        lines.append(
+            f"| {repo.name} | {remote_cell} "
+            f"| {repo.branch} | `{short}` | {install} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def export_lock(catalog: Catalog, out: Path) -> None:
+    save_lock(out, lock_from_catalog(catalog))
+    md_path = out.parent / "VENDOR.md"
+    md_path.write_text(render_vendor_md(catalog), encoding="utf-8")
+    print(f"Wrote {out}")
+    print(f"Wrote {md_path}")
+
+
+@dataclass
+class RepoManifest:
+    install: str | None = None
+    update: str | None = None
+    verify: str | None = None
+    source: str = ""
+
+
+def commands_to_shell(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, list):
+        parts = [str(item).strip() for item in value if str(item).strip()]
+        return " && ".join(parts) if parts else None
+    if isinstance(value, dict):
+        run = value.get("run") or value.get("script")
+        if not run:
+            return None
+        shell = value.get("shell")
+        run = str(run).strip()
+        if shell:
+            return f"{shell} {run}"
+        return run
+    return None
+
+
+def parse_simple_yaml(text: str) -> dict[str, Any]:
+    """Parse a tiny YAML subset: scalars, inline lists, and `-` list blocks."""
+    root: dict[str, Any] = {}
+    current_key: str | None = None
+    list_items: list[str] = []
+
+    def flush_list() -> None:
+        nonlocal current_key, list_items
+        if current_key is not None and list_items:
+            root[current_key] = list_items
+            list_items = []
+            current_key = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        stripped = line.strip()
+        if stripped.startswith("- ") and current_key is not None:
+            list_items.append(stripped[2:].strip().strip('"').strip("'"))
+            continue
+        flush_list()
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if not value:
+            current_key = key
+            list_items = []
+            continue
+        if value.startswith("[") and value.endswith("]"):
+            inner = value[1:-1].strip()
+            if not inner:
+                root[key] = []
+            else:
+                root[key] = [
+                    part.strip().strip('"').strip("'")
+                    for part in inner.split(",")
+                    if part.strip()
+                ]
+        else:
+            root[key] = value.strip('"').strip("'")
+    flush_list()
+    return root
+
+
+def load_manifest_file(path: Path) -> RepoManifest | None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if path.suffix == ".json":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+    else:
+        data = parse_simple_yaml(text)
+    if not isinstance(data, dict):
+        return None
+    install = commands_to_shell(data.get("install"))
+    update = commands_to_shell(data.get("update")) or install
+    verify = commands_to_shell(data.get("verify"))
+    if not any((install, update, verify)):
+        return None
+    return RepoManifest(
+        install=install,
+        update=update,
+        verify=verify,
+        source=path.name,
+    )
+
+
+def read_repo_manifest(repo_path: Path) -> RepoManifest | None:
+    for name in MANIFEST_FILENAMES:
+        manifest_path = repo_path / name
+        if manifest_path.is_file():
+            manifest = load_manifest_file(manifest_path)
+            if manifest:
+                return manifest
+    return None
+
+
+def detect_install_heuristic(repo_path: Path) -> RepoManifest | None:
+    makefile = repo_path / "Makefile"
+    if makefile.is_file():
+        try:
+            content = makefile.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            content = ""
+        if re.search(r"^install\s*:", content, re.MULTILINE):
+            return RepoManifest(install="make install", update="make install", source="Makefile")
+
+    package_json = repo_path / "package.json"
+    if package_json.is_file():
+        try:
+            data = json.loads(package_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        scripts = data.get("scripts", {})
+        if "install" in scripts:
+            cmd = "npm ci" if (repo_path / "package-lock.json").exists() else "npm install"
+            return RepoManifest(install=cmd, update=cmd, source="package.json")
+        if "postinstall" in scripts:
+            cmd = "npm run postinstall"
+            return RepoManifest(install=cmd, update=cmd, source="package.json")
+
+    pyproject = repo_path / "pyproject.toml"
+    if pyproject.is_file() and (repo_path / "uv.lock").exists():
+        return RepoManifest(install="uv sync", update="uv sync", source="pyproject.toml")
+    if (repo_path / "requirements.txt").is_file():
+        return RepoManifest(
+            install="python -m pip install -r requirements.txt",
+            update="python -m pip install -r requirements.txt",
+            source="requirements.txt",
+        )
+
+    composer = repo_path / "composer.json"
+    if composer.is_file():
+        return RepoManifest(install="composer install", update="composer install", source="composer.json")
+
+    go_mod = repo_path / "go.mod"
+    if go_mod.is_file():
+        return RepoManifest(install="go mod download", update="go mod download", source="go.mod")
+
+    return None
+
+
+def discover_repo_hooks(repo_path: Path) -> RepoManifest | None:
+    manifest = read_repo_manifest(repo_path)
+    if manifest:
+        return manifest
+    return detect_install_heuristic(repo_path)
+
+
+def apply_manifest_to_entry(entry: RepoEntry, manifest: RepoManifest) -> None:
+    if manifest.install:
+        entry.install = manifest.install
+    if manifest.update:
+        entry.update = manifest.update
+
+
+def resolve_hook_command(
+    entry: RepoEntry,
+    repo_path: Path,
+    phase: str,
+) -> tuple[str | None, str]:
+    """Return (command, origin) where origin describes where the hook came from."""
+    if phase == "update":
+        if entry.update:
+            return entry.update, "catalog"
+        if entry.install:
+            return entry.install, "catalog-install"
+    elif entry.install:
+        return entry.install, "catalog"
+
+    manifest = discover_repo_hooks(repo_path)
+    if manifest:
+        if phase == "update":
+            cmd = manifest.update or manifest.install
+        else:
+            cmd = manifest.install
+        if cmd:
+            return cmd, manifest.source or "manifest"
+
+    return None, ""
+
+
+def run_hook(entry: RepoEntry, path: Path, phase: str = "install") -> None:
+    command, origin = resolve_hook_command(entry, path, phase)
+    if not command:
+        return
+    label = "update" if phase == "update" else "install"
+    origin_note = f" ({origin})" if origin else ""
+    print(f"  {label}: {entry.name}{origin_note}")
+    result = subprocess.run(
+        command,
+        shell=True,
+        cwd=path,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            f"{label.capitalize()} failed for {entry.name} (exit {result.returncode})"
+        )
+
+
+def run_install(entry: RepoEntry, path: Path) -> None:
+    run_hook(entry, path, phase="install")
+
+
+def run_update_hook(entry: RepoEntry, path: Path) -> None:
+    run_hook(entry, path, phase="update")
+
+
+def clone_repo(url: str, dest: Path, branch: str) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        raise SystemExit(f"Path already exists: {dest}")
+    clone_url = normalize_clone_url(url)
+    print(f"  clone: {clone_url} -> {dest}")
+    try:
+        run_git(None, "clone", "--branch", branch, clone_url, str(dest))
+    except subprocess.CalledProcessError:
+        if is_local_remote(clone_url):
+            run_git(None, "clone", clone_url, str(dest))
+        else:
+            raise
+
+
+def checkout_pin(path: Path, commit: str) -> None:
+    run_git(path, "fetch", "origin", commit, check=False)
+    run_git(path, "checkout", "--detach", commit)
+
+
+def can_use_github_api(remote_id: str, url: str | None = None) -> bool:
+    if remote_id.startswith("local:"):
+        return False
+    if url and parse_github_remote(url):
+        return True
+    parts = remote_id.split("/")
+    return len(parts) == 2 and "." not in parts[0]
+
+
+def merge_in_progress(path: Path) -> bool:
+    return (path / ".git" / "MERGE_HEAD").exists()
+
+
+def rebase_in_progress(path: Path) -> bool:
+    git_dir = path / ".git"
+    return (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists()
+
+
+def list_conflicts(path: Path) -> list[str]:
+    try:
+        result = run_git(path, "diff", "--name-only", "--diff-filter=U")
+    except subprocess.CalledProcessError:
+        return []
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def consolidate_repo(
+    catalog: Catalog,
+    entry: RepoEntry,
+    *,
+    strategy: str,
+    mode: str,
+) -> tuple[str, list[str]]:
+    """Return (outcome, log_lines). outcome: ok|skipped|conflict|error"""
+    path = repo_abs_path(catalog, entry)
+    logs: list[str] = []
+    if not path.exists() or not (path / ".git").exists():
+        print(f"  missing - run install")
+        return "error", [f"missing {entry.name}"]
+
+    if mode == "abort":
+        if merge_in_progress(path):
+            run_git(path, "merge", "--abort", check=False)
+            print(f"  aborted merge")
+            return "ok", [f"aborted merge {entry.name}"]
+        if rebase_in_progress(path):
+            run_git(path, "rebase", "--abort", check=False)
+            print(f"  aborted rebase")
+            return "ok", [f"aborted rebase {entry.name}"]
+        print(f"  no merge/rebase in progress")
+        return "skipped", []
+
+    if mode == "continue":
+        if merge_in_progress(path):
+            run_git(path, "merge", "--continue", check=False)
+        elif rebase_in_progress(path):
+            run_git(path, "rebase", "--continue", check=False)
+        else:
+            print(f"  no merge/rebase in progress")
+            return "skipped", []
+        conflicts = list_conflicts(path)
+        if conflicts or merge_in_progress(path) or rebase_in_progress(path):
+            print(f"  still has conflicts ({len(conflicts)} file(s))")
+            for f in conflicts[:10]:
+                print(f"    {f}")
+            return "conflict", [f"conflict {entry.name}"]
+        head = current_commit(path)
+        if head:
+            entry.commit = head
+            print(f"  consolidated @ {head[:7]}")
+        return "ok", [f"continued {entry.name}"]
+
+    # default: pull / merge / rebase
+    if merge_in_progress(path) or rebase_in_progress(path):
+        conflicts = list_conflicts(path)
+        print(f"  merge/rebase already in progress ({len(conflicts)} conflict(s))")
+        for f in conflicts[:10]:
+            print(f"    {f}")
+        print(f"  fix files, then: git-updater consolidate --continue {entry.name}")
+        return "conflict", [f"in-progress {entry.name}"]
+
+    if is_dirty(path):
+        print(f"  skipped (dirty working tree)")
+        return "skipped", [f"skip dirty {entry.name}"]
+
+    branch = current_branch(path) or entry.branch
+    run_git(path, "fetch", "origin", check=False)
+    ahead, behind = ahead_behind(path, branch)
+    old_commit = entry.commit
+
+    if not behind:
+        head = current_commit(path)
+        if head and head != entry.commit:
+            entry.commit = head
+        print(f"  up to date")
+        return "ok", []
+
+    if behind and not ahead:
+        try:
+            run_git(path, "merge", "--ff-only", f"origin/{branch}")
+            new_commit = current_commit(path)
+            if new_commit:
+                entry.commit = new_commit
+                print(f"  fast-forward {old_commit[:7]} -> {new_commit[:7]}")
+                if new_commit and new_commit != old_commit and resolve_hook_command(
+                    entry, path, "update"
+                )[0]:
+                    run_update_hook(entry, path)
+            return "ok", [f"ff {entry.name}"]
+        except subprocess.CalledProcessError:
+            print(f"  fast-forward failed - trying {strategy}")
+
+    try:
+        if strategy == "rebase":
+            run_git(path, "rebase", f"origin/{branch}")
+        else:
+            run_git(path, "merge", f"origin/{branch}")
+    except subprocess.CalledProcessError:
+        conflicts = list_conflicts(path)
+        print(f"  conflict ({len(conflicts)} file(s))")
+        for f in conflicts[:10]:
+            print(f"    {f}")
+        print(f"  fix files, then: git-updater consolidate --continue {entry.name}")
+        print(f"  or abort: git-updater consolidate --abort {entry.name}")
+        return "conflict", [f"conflict {entry.name}"]
+
+    new_commit = current_commit(path)
+    if new_commit:
+        entry.commit = new_commit
+        print(f"  consolidated {old_commit[:7]} -> {new_commit[:7]}")
+        if new_commit and new_commit != old_commit and resolve_hook_command(
+            entry, path, "update"
+        )[0]:
+            run_update_hook(entry, path)
+    return "ok", [f"consolidated {entry.name}"]
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    ensure_config_dir()
+    root = normalize_path(args.root)
+    if CATALOG_PATH.exists() and not args.force:
+        raise SystemExit(f"Catalog already exists at {CATALOG_PATH} (use --force)")
+    catalog = Catalog(version=CATALOG_VERSION, root=root, repos=[])
+    save_catalog(catalog)
+    print(f"Initialized catalog at {CATALOG_PATH}")
+    print(f"Clone root: {root}")
+
+
+def cmd_consolidate(args: argparse.Namespace) -> None:
+    catalog = load_catalog()
+    repos = select_repos(catalog, args.name)
+    mode = "default"
+    if args.continue_:
+        mode = "continue"
+    elif args.abort:
+        mode = "abort"
+    strategy = "rebase" if args.rebase else "merge"
+    log_lines: list[str] = []
+    conflicts = 0
+    for entry in repos:
+        print(f"-> {entry.name}")
+        outcome, lines = consolidate_repo(
+            catalog,
+            entry,
+            strategy=strategy,
+            mode=mode,
+        )
+        log_lines.extend(lines)
+        if outcome == "conflict":
+            conflicts += 1
+    save_catalog(catalog)
+    if log_lines:
+        log_path = write_log("consolidate", log_lines)
+        print(f"Log: {log_path}")
+    if conflicts:
+        raise SystemExit(f"{conflicts} repo(s) need manual conflict resolution")
+
+
+def cmd_scan(args: argparse.Namespace) -> None:
+    catalog = load_catalog()
+    root = Path(catalog.root)
+    known = catalog_paths(catalog)
+    unknown: list[Path] = []
+    for git_dir in discover_git_dirs(root):
+        if git_dir.resolve().as_posix() not in known:
+            unknown.append(git_dir)
+    if not unknown:
+        print("No unscanned git repos under root.")
+        return
+    print(f"Git repos not in catalog ({len(unknown)}):")
+    for path in unknown:
+        rel = path.relative_to(root) if path.is_relative_to(root) else path
+        origin = read_origin(path)
+        slug = origin[0] if origin else "?"
+        manifest = discover_repo_hooks(path)
+        hook = f" [{manifest.source}]" if manifest else ""
+        print(f"  {rel}\t{slug}{hook}")
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    catalog = load_catalog()
+    try:
+        default_name, remote_id, url = parse_repo_spec(args.repo)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    name = unique_name(catalog, args.name or default_name)
+    path = args.path or name
+    dest = Path(catalog.root) / path
+    branch = args.branch or "main"
+
+    if dest.exists():
+        raise SystemExit(f"Path already exists: {dest} (use adopt instead)")
+
+    clone_repo(url, dest, branch)
+    commit = current_commit(dest)
+    if not commit:
+        raise SystemExit(f"Clone failed: {dest}")
+
+    entry = RepoEntry(
+        name=name,
+        remote=remote_id,
+        url=url,
+        path=path.replace("\\", "/"),
+        branch=branch,
+        commit=commit,
+    )
+    if args.install:
+        entry.install = args.install
+    else:
+        manifest = discover_repo_hooks(dest)
+        if manifest:
+            apply_manifest_to_entry(entry, manifest)
+            print(f"  hooks from {manifest.source}")
+    catalog.repos.append(entry)
+    save_catalog(catalog)
+    if resolve_hook_command(entry, dest, "install")[0]:
+        run_install(entry, dest)
+    print(f"Added {name} @ {commit[:7]}")
+
+
+def cmd_adopt(args: argparse.Namespace) -> None:
+    catalog = load_catalog()
+    folder = args.folder
+    path = Path(folder)
+    if not path.is_absolute():
+        path = Path(catalog.root) / folder
+    path = path.resolve()
+    root = Path(catalog.root).resolve()
+
+    if not path.is_relative_to(root):
+        raise SystemExit(f"Path must be under clone root {root}")
+
+    origin = read_origin(path)
+    if not origin:
+        raise SystemExit(f"Not a git repo with an origin remote: {path}")
+
+    remote_id, url = origin
+    rel = path.relative_to(root).as_posix()
+    name = args.name or unique_name(catalog, path.name)
+    branch = current_branch(path) or args.branch or "main"
+    commit = current_commit(path)
+    if not commit:
+        raise SystemExit(f"Could not read HEAD: {path}")
+
+    if catalog.find(name):
+        raise SystemExit(f"Name already in catalog: {name}")
+
+    entry = RepoEntry(
+        name=name,
+        remote=remote_id,
+        url=url,
+        path=rel,
+        branch=branch,
+        commit=commit,
+    )
+    if args.install:
+        entry.install = args.install
+    else:
+        manifest = discover_repo_hooks(path)
+        if manifest:
+            apply_manifest_to_entry(entry, manifest)
+            print(f"  hooks from {manifest.source}")
+    catalog.repos.append(entry)
+    save_catalog(catalog)
+    print(f"Adopted {name} @ {commit[:7]} ({remote_id})")
+
+
+def cmd_sync_hooks(args: argparse.Namespace) -> None:
+    catalog = load_catalog()
+    repos = select_repos(catalog, args.name)
+    changed = 0
+    for entry in repos:
+        path = repo_abs_path(catalog, entry)
+        if not path.exists():
+            print(f"  skip {entry.name}: missing")
+            continue
+        manifest = discover_repo_hooks(path)
+        if not manifest:
+            print(f"  skip {entry.name}: no manifest/heuristic")
+            continue
+        before = (entry.install, entry.update)
+        apply_manifest_to_entry(entry, manifest)
+        after = (entry.install, entry.update)
+        if after != before:
+            changed += 1
+            print(f"  synced {entry.name} from {manifest.source}")
+            if entry.install:
+                print(f"    install: {entry.install}")
+            if entry.update and entry.update != entry.install:
+                print(f"    update:  {entry.update}")
+        else:
+            print(f"  unchanged {entry.name} ({manifest.source})")
+    save_catalog(catalog)
+    print(f"Synced {changed} repo(s)")
+
+
+def cmd_rm(args: argparse.Namespace) -> None:
+    catalog = load_catalog()
+    if not catalog.remove(args.name):
+        raise SystemExit(f"Unknown repo: {args.name}")
+    save_catalog(catalog)
+    print(f"Removed {args.name} from catalog (folder untouched)")
+
+
+def print_status_table(rows: list[tuple[str, str, str, str]]) -> None:
+    name_w = max(len("Name"), *(len(r[0]) for r in rows)) if rows else 4
+    stat_w = max(len("Status"), *(len(r[1]) for r in rows)) if rows else 6
+    print(f"{'Name'.ljust(name_w)}  {'Status'.ljust(stat_w)}  Commit   Remote")
+    print(f"{'-' * name_w}  {'-' * stat_w}  -------  ------")
+    for name, status, short, remote in rows:
+        print(f"{name.ljust(name_w)}  {status.ljust(stat_w)}  {short}  {remote}")
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    catalog = load_catalog()
+    repos = select_repos(catalog, args.name)
+    rows: list[tuple[str, str, str, str]] = []
+    for entry in repos:
+        status = classify_repo(catalog, entry, fetch=args.fetch)
+        short = entry.commit[:7]
+        rows.append((entry.name, status, short, entry.remote))
+    print_status_table(rows)
+
+
+def cmd_pin(args: argparse.Namespace) -> None:
+    catalog = load_catalog()
+    repos = select_repos(catalog, args.name)
+    for entry in repos:
+        path = repo_abs_path(catalog, entry)
+        if not path.exists():
+            raise SystemExit(f"Missing: {entry.name} ({path})")
+        commit = current_commit(path)
+        if not commit:
+            raise SystemExit(f"Not a git repo: {path}")
+        branch = current_branch(path)
+        if branch:
+            entry.branch = branch
+        old = entry.commit[:7]
+        entry.commit = commit
+        print(f"  pinned {entry.name}: {old} -> {commit[:7]}")
+    save_catalog(catalog)
+    if args.export:
+        out = Path(catalog.root) / "vendor.lock"
+        export_lock(catalog, out)
+
+
+def cmd_install(args: argparse.Namespace) -> None:
+    catalog = load_catalog()
+    repos = select_repos(catalog, args.name)
+    log_lines: list[str] = []
+    for entry in repos:
+        path = repo_abs_path(catalog, entry)
+        if not path.exists() or not (path / ".git").exists():
+            clone_repo(entry.url, path, entry.branch)
+            checkout_pin(path, entry.commit)
+            log_lines.append(f"cloned {entry.name}")
+        else:
+            head = current_commit(path)
+            if head != entry.commit:
+                checkout_pin(path, entry.commit)
+                log_lines.append(f"checked out {entry.name} @ {entry.commit[:7]}")
+        if resolve_hook_command(entry, path, "install")[0]:
+            run_install(entry, path)
+            log_lines.append(f"installed {entry.name}")
+    if log_lines:
+        log_path = write_log("install", log_lines)
+        print(f"Log: {log_path}")
+
+
+def cmd_update(args: argparse.Namespace) -> None:
+    catalog = load_catalog()
+    repos = select_repos(catalog, args.name)
+    log_lines: list[str] = []
+    for entry in repos:
+        path = repo_abs_path(catalog, entry)
+        print(f"→ {entry.name}")
+        if not path.exists():
+            print(f"  missing — run install")
+            continue
+        if is_dirty(path):
+            print(f"  skipped (dirty working tree)")
+            log_lines.append(f"skip dirty {entry.name}")
+            continue
+        branch = current_branch(path) or entry.branch
+        run_git(path, "fetch", "origin", check=False)
+        ahead, behind = ahead_behind(path, branch)
+        old_commit = entry.commit
+        if behind and not ahead:
+            run_git(path, "merge", "--ff-only", f"origin/{branch}")
+            new_commit = current_commit(path)
+            if new_commit:
+                entry.commit = new_commit
+                print(f"  fast-forward {old_commit[:7]} -> {new_commit[:7]}")
+                log_lines.append(f"updated {entry.name} {old_commit[:7]}->{new_commit[:7]}")
+                if new_commit and new_commit != old_commit and resolve_hook_command(
+                    entry, path, "update"
+                )[0]:
+                    run_update_hook(entry, path)
+        elif behind and ahead:
+            print(f"  diverged (ahead {ahead}, behind {behind}) — manual merge required")
+            log_lines.append(f"diverged {entry.name}")
+        elif behind:
+            print(f"  behind {behind} — could not fast-forward")
+        else:
+            head = current_commit(path)
+            if head and head != entry.commit:
+                entry.commit = head
+                print(f"  re-pinned to {head[:7]}")
+            else:
+                print(f"  up to date")
+    save_catalog(catalog)
+    if log_lines:
+        log_path = write_log("update", log_lines)
+        print(f"Log: {log_path}")
+
+
+def cmd_push(args: argparse.Namespace) -> None:
+    catalog = load_catalog()
+    repos = select_repos(catalog, args.name)
+    log_lines: list[str] = []
+    for entry in repos:
+        path = repo_abs_path(catalog, entry)
+        print(f"→ {entry.name}")
+        if not path.exists():
+            print(f"  missing")
+            continue
+        if is_dirty(path):
+            print(f"  skipped (dirty working tree)")
+            continue
+        branch = current_branch(path) or entry.branch
+        run_git(path, "push", "origin", branch)
+        head = current_commit(path)
+        if head:
+            entry.commit = head
+            entry.branch = branch
+            print(f"  pushed @ {head[:7]}")
+            log_lines.append(f"pushed {entry.name} @ {head[:7]}")
+    save_catalog(catalog)
+    if log_lines:
+        log_path = write_log("push", log_lines)
+        print(f"Log: {log_path}")
+
+
+def cmd_export(args: argparse.Namespace) -> None:
+    catalog = load_catalog()
+    out = Path(args.out) if args.out else Path(catalog.root) / "vendor.lock"
+    export_lock(catalog, out)
+
+
+def cmd_replicate(args: argparse.Namespace) -> None:
+    lock_path = Path(args.lockfile)
+    data = load_lock(lock_path)
+    root = normalize_path(args.root or data.get("root", "."))
+    root_path = Path(root)
+    log_lines: list[str] = []
+
+    for raw in data.get("repos", []):
+        entry = RepoEntry.from_dict(raw)
+        dest = root_path / entry.path
+        print(f"→ {entry.name}")
+
+        if args.dry_run:
+            action = "clone+checkout" if not dest.exists() else "checkout"
+            print(f"  [dry-run] would {action} @ {entry.commit[:7]}")
+            if entry.install:
+                print(f"  [dry-run] would run install: {entry.install}")
+            else:
+                cmd, origin = resolve_hook_command(entry, dest, "install")
+                if cmd:
+                    print(f"  [dry-run] would run install ({origin}): {cmd}")
+            continue
+
+        if not dest.exists():
+            clone_repo(entry.url, dest, entry.branch)
+            checkout_pin(dest, entry.commit)
+            log_lines.append(f"cloned {entry.name}")
+        else:
+            head = current_commit(dest)
+            if head != entry.commit:
+                checkout_pin(dest, entry.commit)
+                log_lines.append(f"checked out {entry.name} @ {entry.commit[:7]}")
+            else:
+                print(f"  already at {entry.commit[:7]}")
+
+        if resolve_hook_command(entry, dest, "install")[0]:
+            run_install(entry, dest)
+            log_lines.append(f"installed {entry.name}")
+
+    if log_lines:
+        log_path = write_log("replicate", log_lines)
+        print(f"Log: {log_path}")
+    elif args.dry_run:
+        print("Dry run complete.")
+
+
+def cmd_self_check(args: argparse.Namespace) -> None:
+    result = check_self(fetch=args.fetch, use_cache=not args.fetch)
+    if args.json:
+        payload = asdict(result)
+        payload["install_path"] = normalize_path(result.install_path)
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(format_self_check(result))
+    if result.status in ("behind", "diverged", "dirty"):
+        raise SystemExit(1)
+    if result.status == "unknown":
+        raise SystemExit(2)
+
+
+def cmd_self_update(args: argparse.Namespace) -> None:
+    root = install_root()
+    if not (root / ".git").exists():
+        raise SystemExit(
+            "git-updater is not a git checkout — clone from GitHub to self-update."
+        )
+    result = check_self(fetch=True, use_cache=False)
+    print(format_self_check(result))
+    if result.status == "up-to-date":
+        return
+    if result.status == "dirty":
+        raise SystemExit("Refusing to self-update: working tree has local changes.")
+    if result.status == "diverged":
+        raise SystemExit("Refusing to self-update: diverged from upstream.")
+    if result.status == "unknown":
+        raise SystemExit("Could not determine upstream state.")
+    branch = result.branch or current_branch(root) or "main"
+    if is_dirty(root):
+        raise SystemExit("Refusing to self-update: working tree has local changes.")
+    print(f"→ git pull --ff-only origin {branch}")
+    run_git(root, "pull", "--ff-only", "origin", branch)
+    new_head = current_commit(root)
+    if new_head:
+        print(f"Updated to {new_head[:7]}")
+    check_self(fetch=False, use_cache=False)
+
+
+def cmd_verify(args: argparse.Namespace) -> None:
+    catalog = load_catalog()
+    lock_path = Path(args.lock) if args.lock else Path(catalog.root) / "vendor.lock"
+    if lock_path.exists():
+        data = load_lock(lock_path)
+        root = Path(args.root or data.get("root", catalog.root))
+        entries = [RepoEntry.from_dict(r) for r in data.get("repos", [])]
+    else:
+        root = Path(catalog.root)
+        entries = catalog.repos
+
+    failed = 0
+    for entry in entries:
+        path = root / entry.path
+        if not path.exists():
+            print(f"FAIL {entry.name}: missing ({path})")
+            failed += 1
+            continue
+        head = current_commit(path)
+        if head != entry.commit:
+            short = entry.commit[:7]
+            got = head[:7] if head else "?"
+            print(f"FAIL {entry.name}: want {short}, got {got}")
+            failed += 1
+        else:
+            print(f"OK   {entry.name} @ {entry.commit[:7]}")
+
+    if failed:
+        raise SystemExit(1)
+    print(f"All {len(entries)} repos match lock.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="git-updater",
+        description="Track git repos, pin commits, export vendor.lock, replicate stacks.",
+    )
+    parser.add_argument(
+        "--no-self-check",
+        action="store_true",
+        help="Skip automatic self-update check after command",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("init", help="Create ~/.git-updater/catalog.json")
+    p.add_argument("--root", required=True, help="Clone root directory")
+    p.add_argument("--force", action="store_true", help="Overwrite existing catalog")
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("scan", help="List git repos under root not in catalog")
+    p.set_defaults(func=cmd_scan)
+
+    p = sub.add_parser("add", help="Clone and register a repo")
+    p.add_argument(
+        "repo",
+        help="owner/repo, any git URL (https/ssh), file:// path, or local folder",
+    )
+    p.add_argument("--name", help="Catalog name (default: repo name)")
+    p.add_argument("--path", help="Relative path under root")
+    p.add_argument("--branch", default="main")
+    p.add_argument(
+        "--install",
+        help="Override install hook (default: read .git-updater.yaml from repo)",
+    )
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("adopt", help="Register an existing clone")
+    p.add_argument("folder", help="Folder name or path under root")
+    p.add_argument("--name", help="Catalog name")
+    p.add_argument("--branch", help="Override branch")
+    p.add_argument(
+        "--install",
+        help="Override install hook (default: read .git-updater.yaml from repo)",
+    )
+    p.set_defaults(func=cmd_adopt)
+
+    p = sub.add_parser(
+        "sync-hooks",
+        help="Refresh install/update hooks from each repo's .git-updater manifest",
+    )
+    p.add_argument("name", nargs="?", help="Single repo")
+    p.set_defaults(func=cmd_sync_hooks)
+
+    p = sub.add_parser("rm", help="Remove from catalog (keeps folder)")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_rm)
+
+    p = sub.add_parser("status", help="Show pin status")
+    p.add_argument("name", nargs="?", help="Single repo")
+    p.add_argument("--fetch", action="store_true", help="Fetch before comparing remote")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("pin", help="Pin catalog to current HEAD")
+    p.add_argument("name", nargs="?", help="Single repo")
+    p.add_argument("--export", action="store_true", help="Also write vendor.lock")
+    p.set_defaults(func=cmd_pin)
+
+    p = sub.add_parser("install", help="Clone missing repos and run install hooks")
+    p.add_argument("name", nargs="?", help="Single repo")
+    p.set_defaults(func=cmd_install)
+
+    p = sub.add_parser("update", help="Fetch and fast-forward clean repos")
+    p.add_argument("name", nargs="?", help="Single repo")
+    p.set_defaults(func=cmd_update)
+
+    p = sub.add_parser(
+        "consolidate",
+        help="Fetch and merge/rebase when update would fail; resolve conflicts stepwise",
+    )
+    p.add_argument("name", nargs="?", help="Single repo")
+    p.add_argument(
+        "--rebase",
+        action="store_true",
+        help="Use rebase instead of merge when not fast-forwardable",
+    )
+    p.add_argument(
+        "--continue",
+        dest="continue_",
+        action="store_true",
+        help="Continue after you fixed merge/rebase conflicts",
+    )
+    p.add_argument(
+        "--abort",
+        action="store_true",
+        help="Abort an in-progress merge or rebase",
+    )
+    p.set_defaults(func=cmd_consolidate)
+
+    p = sub.add_parser("push", help="Push tracking branch")
+    p.add_argument("name", nargs="?", help="Single repo")
+    p.set_defaults(func=cmd_push)
+
+    p = sub.add_parser("export", help="Write vendor.lock and VENDOR.md")
+    p.add_argument("--out", help="Lock file path (default: <root>/vendor.lock)")
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("replicate", help="Bootstrap stack from vendor.lock")
+    p.add_argument("lockfile", help="Path to vendor.lock")
+    p.add_argument("--root", help="Override clone root from lock")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_replicate)
+
+    p = sub.add_parser("verify", help="Check clones match lock (exit 1 on drift)")
+    p.add_argument("--lock", help="Lock file (default: <root>/vendor.lock)")
+    p.add_argument("--root", help="Override root")
+    p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("self-check", help="Check whether git-updater itself is up to date")
+    p.add_argument(
+        "--fetch",
+        action="store_true",
+        help="Fetch from origin / GitHub before comparing (bypasses 24h cache)",
+    )
+    p.add_argument("--json", action="store_true", help="Also print machine-readable result")
+    p.set_defaults(func=cmd_self_check)
+
+    p = sub.add_parser("self-update", help="Fast-forward git-updater to latest upstream")
+    p.set_defaults(func=cmd_self_update)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.func(args)
+    if (
+        not args.no_self_check
+        and args.command not in SKIP_SELF_CHECK_COMMANDS
+    ):
+        maybe_warn_self_update()
+
+
+if __name__ == "__main__":
+    main()
