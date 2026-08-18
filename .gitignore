@@ -6,3 +6,7 @@ __pycache__/
 venv/
 .agents/
 .cursor/
+build/
+dist/
+*.egg-info/
+.eggs/

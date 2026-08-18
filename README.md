@@ -20,13 +20,16 @@ Per-app library pins (a `vendor.lock` *inside* one project) pin trees in that pr
 
 ## Install
 
-No dependencies beyond Python 3.9+ and Git.
+Python 3.9+, Git, and pip. From a clone:
 
 ```powershell
-python git_updater.py --help
-# or, from this directory:
-git-updater.cmd --help
+python -m pip install -e .
+git-updater --help
 ```
+
+That puts `git-updater` on PATH (Windows: the Python `Scripts` folder). Editable (`-e`) keeps the command pointed at this checkout, so `self-update` / `git pull` still work.
+
+Without installing, you can still run `python git_updater.py` or `git-updater.cmd` from this directory.
 
 ## Quick start
 
@@ -60,17 +63,18 @@ This repo publishes a starter lock for the tools we share. It does **not** pin g
 ```powershell
 cd <clone-root>
 git clone https://github.com/Lolaplex/git-updater.git
-python git-updater/git_updater.py init --root .
-python git-updater/git_updater.py adopt git-updater
-python git-updater/git_updater.py replicate git-updater/examples/shared.lock --root .
-python git-updater/git_updater.py adopt agent-memory
+python -m pip install -e git-updater
+git-updater init --root .
+git-updater adopt git-updater
+git-updater replicate git-updater/examples/shared.lock --root .
+git-updater adopt agent-memory
 ```
 
 Daily sync (pull when the other person pushed):
 
 ```powershell
-python git-updater/git_updater.py update agent-memory
-python git-updater/git_updater.py push agent-memory   # after your own commits
+git-updater update agent-memory
+git-updater push agent-memory   # after your own commits
 ```
 
 `update` fast-forwards a clean tree and re-runs install hooks when the commit changes. Dirty or diverged trees are left alone — `consolidate` if you both edited.
