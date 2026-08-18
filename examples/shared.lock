@@ -5,10 +5,10 @@
       "name": "agent-memory",
       "remote": "lolaplex/agent-memory",
       "github": "lolaplex/agent-memory",
-      "url": "https://github.com/lolaplex/agent-memory.git",
+      "url": "https://github.com/Lolaplex/agent-memory.git",
       "path": "agent-memory",
       "branch": "main",
-      "commit": "98d12bc39a0115219661782a00fb93a3681de93a",
+      "commit": "4809de8a6520e0a85abd3c8f257c8158b87006f6",
       "install": "python -m pip install -r requirements.txt",
       "update": "python -m pip install -r requirements.txt"
     }
