@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
@@ -25,12 +26,13 @@ LOG_DIR = CONFIG_DIR / "logs"
 SELF_CHECK_CACHE = CONFIG_DIR / "self-check.json"
 SELF_CHECK_TTL_SECS = 24 * 60 * 60
 SKIP_SELF_CHECK_COMMANDS = frozenset(
-    {"self-check", "self-update", "init", "help", "man", "install-skills"}
+    {"self-check", "self-update", "init", "help", "man", "install-skills", "pin", "hook-sync"}
 )
-AUTO_SELF_UPDATE_COMMANDS = frozenset({"update", "install", "replicate", "consolidate"})
 SKILL_NAME = "git-updater"
 SKILL_PATHS_BEGIN = "<!-- git-updater-paths -->"
 SKILL_PATHS_END = "<!-- /git-updater-paths -->"
+PIN_HOOK_MARKER = "git-updater-managed: pin --here"
+PIN_HOOK_NAMES = ("post-commit", "post-merge", "post-rewrite", "post-checkout")
 
 MANIFEST_FILENAMES = (
     ".git-updater.json",
@@ -528,16 +530,22 @@ def maybe_warn_self_update() -> None:
         )
 
 
-def apply_self_update(*, interactive: bool = True) -> SelfCheckResult:
+def apply_self_update(
+    *,
+    interactive: bool = True,
+    observed: SelfCheckResult | None = None,
+) -> SelfCheckResult:
     """Fast-forward this checkout from remotes that are descendants of HEAD, then reinstall."""
     root = install_root()
     if not (root / ".git").exists():
         message = "git-updater is not a git checkout - clone from GitHub to self-update."
         if interactive:
             raise SystemExit(message)
-        return check_self(fetch=False, use_cache=True)
+        return observed or check_self(fetch=False, use_cache=True)
 
-    result = check_self(fetch=True, use_cache=False)
+    result = observed if observed is not None else check_self(
+        fetch=True, use_cache=False
+    )
     if interactive:
         print(format_self_check(result))
     if result.status == "up-to-date":
@@ -622,9 +630,16 @@ def _pin_catalog_self(
 
 
 def maybe_apply_self_update() -> None:
+    """Observe at most once per TTL; patch only when residual is a safe fast-forward."""
     if os.environ.get("GIT_UPDATER_SKIP_SELF_CHECK") == "1":
         return
-    apply_self_update(interactive=False)
+    cached = load_self_check_cache()
+    if cached and cache_is_fresh(cached, fetch=False):
+        maybe_warn_self_update()
+        return
+    result = check_self(fetch=True, use_cache=False)
+    if result.status == "behind":
+        apply_self_update(interactive=False, observed=result)
 
 
 def run_git(
@@ -1146,6 +1161,128 @@ def select_repos(catalog: Catalog, name: str | None) -> list[RepoEntry]:
             raise SystemExit(f"Unknown repo: {name}")
         return [entry]
     return list(catalog.repos)
+
+
+def catalog_entry_for_path(catalog: Catalog, path: Path) -> RepoEntry | None:
+    resolved = path.resolve()
+    for entry in catalog.repos:
+        try:
+            if repo_abs_path(catalog, entry).resolve() == resolved:
+                return entry
+        except OSError:
+            continue
+    return None
+
+
+def log_hook_pin(message: str) -> None:
+    ensure_config_dir()
+    log_path = LOG_DIR / "hook-pin.log"
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{stamp} {message}\n")
+
+
+def resolve_git_updater_invoke() -> str:
+    if shutil.which("git-updater"):
+        return "git-updater"
+    script = install_root() / "git_updater.py"
+    if shutil.which("py"):
+        return f'py -3 "{script}"'
+    for name in ("python3", "python"):
+        exe = shutil.which(name)
+        if exe:
+            return f'"{exe}" "{script}"'
+    return "git-updater"
+
+
+def pin_hook_script(hook_name: str, invoke: str) -> str:
+    lines = [
+        "#!/bin/sh",
+        f"# {PIN_HOOK_MARKER}",
+        'LOG="${HOME:-$USERPROFILE}/.git-updater/logs/hook-pin.log"',
+        'mkdir -p "$(dirname "$LOG")" 2>/dev/null || true',
+    ]
+    if hook_name == "post-checkout":
+        lines.append('if [ "$1" = "$2" ]; then exit 0; fi')
+    lines.append(f'{invoke} pin --here --quiet 2>>"$LOG" || true')
+    lines.append("")
+    return "\n".join(lines)
+
+
+def install_pin_hooks(repo_path: Path, *, force: bool = False) -> tuple[list[str], list[str]]:
+    """Install git hooks that keep the catalog pin in sync with HEAD."""
+    hooks_dir = repo_path / ".git" / "hooks"
+    if not hooks_dir.is_dir():
+        return [], [f"missing .git/hooks under {repo_path}"]
+    invoke = resolve_git_updater_invoke()
+    installed: list[str] = []
+    skipped: list[str] = []
+    for hook_name in PIN_HOOK_NAMES:
+        hook_path = hooks_dir / hook_name
+        content = pin_hook_script(hook_name, invoke)
+        if hook_path.exists():
+            existing = hook_path.read_text(encoding="utf-8", errors="replace")
+            if PIN_HOOK_MARKER in existing:
+                hook_path.write_text(content, encoding="utf-8", newline="\n")
+                installed.append(hook_name)
+                continue
+            if force:
+                hook_path.write_text(
+                    existing.rstrip() + "\n\n" + content,
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                installed.append(hook_name)
+                continue
+            skipped.append(f"{hook_name} (foreign hook)")
+            continue
+        hook_path.write_text(content, encoding="utf-8", newline="\n")
+        installed.append(hook_name)
+        try:
+            hook_path.chmod(hook_path.stat().st_mode | 0o111)
+        except OSError:
+            pass
+    return installed, skipped
+
+
+def sync_pin_hooks(repo_path: Path, repo_name: str, *, force: bool = False) -> None:
+    installed, skipped = install_pin_hooks(repo_path, force=force)
+    if installed:
+        print(f"  {repo_name}: installed {', '.join(installed)}")
+    for reason in skipped:
+        print(f"  {repo_name}: skip {reason}")
+
+
+def pin_entry(
+    catalog: Catalog, entry: RepoEntry, *, quiet: bool = False
+) -> bool:
+    """Pin catalog entry to HEAD. Returns True when commit changed."""
+    path = repo_abs_path(catalog, entry)
+    if not path.exists():
+        message = f"Missing: {entry.name} ({path})"
+        if quiet:
+            log_hook_pin(message)
+            return False
+        raise SystemExit(message)
+    commit = current_commit(path)
+    if not commit:
+        message = f"Not a git repo: {path}"
+        if quiet:
+            log_hook_pin(message)
+            return False
+        raise SystemExit(message)
+    branch = current_branch(path)
+    if branch:
+        entry.branch = branch
+    old = entry.commit
+    changed = old != commit
+    entry.commit = commit
+    if quiet:
+        if changed:
+            log_hook_pin(f"pinned {entry.name}: {old[:7]} -> {commit[:7]}")
+    else:
+        print(f"  pinned {entry.name}: {old[:7]} -> {commit[:7]}")
+    return changed
 
 
 def unique_name(catalog: Catalog, base: str) -> str:
@@ -1788,6 +1925,7 @@ def cmd_add(args: argparse.Namespace) -> None:
     save_catalog(catalog)
     if resolve_hook_command(entry, dest, "install")[0]:
         run_install(entry, dest)
+    sync_pin_hooks(dest, entry.name)
     print(f"Added {name} @ {commit[:7]}")
 
 
@@ -1866,6 +2004,7 @@ def adopt_if_needed(
     catalog.repos.append(entry)
     save_catalog(catalog)
     print(f"Adopted {entry.name} @ {entry.commit[:7]} ({entry.remote})")
+    sync_pin_hooks(path, entry.name)
     return entry
 
 
@@ -1891,6 +2030,7 @@ def cmd_adopt(args: argparse.Namespace) -> None:
     print(f"Adopted {entry.name} @ {entry.commit[:7]} ({entry.remote})")
     if entry.mirrors:
         print("  fetch remotes: " + ", ".join(remote_id_from_url(m) for m in entry.mirrors))
+    sync_pin_hooks(path, entry.name)
 
 
 def cmd_sync_hooks(args: argparse.Namespace) -> None:
@@ -1952,24 +2092,40 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 def cmd_pin(args: argparse.Namespace) -> None:
     catalog = load_catalog()
+    if args.here:
+        if args.name:
+            raise SystemExit("Use either NAME or --here, not both")
+        entry = catalog_entry_for_path(catalog, Path.cwd())
+        if not entry:
+            message = f"No catalog entry for {Path.cwd()}"
+            if args.quiet:
+                log_hook_pin(message)
+                return
+            raise SystemExit(message)
+        pin_entry(catalog, entry, quiet=args.quiet)
+        save_catalog(catalog)
+        if args.export:
+            out = Path(catalog.root) / "vendor.lock"
+            export_lock(catalog, out)
+        return
     repos = select_repos(catalog, args.name)
     for entry in repos:
-        path = repo_abs_path(catalog, entry)
-        if not path.exists():
-            raise SystemExit(f"Missing: {entry.name} ({path})")
-        commit = current_commit(path)
-        if not commit:
-            raise SystemExit(f"Not a git repo: {path}")
-        branch = current_branch(path)
-        if branch:
-            entry.branch = branch
-        old = entry.commit[:7]
-        entry.commit = commit
-        print(f"  pinned {entry.name}: {old} -> {commit[:7]}")
+        pin_entry(catalog, entry, quiet=False)
     save_catalog(catalog)
     if args.export:
         out = Path(catalog.root) / "vendor.lock"
         export_lock(catalog, out)
+
+
+def cmd_hook_sync(args: argparse.Namespace) -> None:
+    catalog = load_catalog()
+    repos = select_repos(catalog, args.name)
+    for entry in repos:
+        path = repo_abs_path(catalog, entry)
+        if not path.exists():
+            print(f"  skip {entry.name}: missing")
+            continue
+        sync_pin_hooks(path, entry.name, force=args.force)
 
 
 def cmd_install(args: argparse.Namespace) -> None:
@@ -2439,7 +2595,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-self-check",
         action="store_true",
-        help="Skip automatic self-update after update/install/replicate/consolidate",
+        help="Skip residual self-update (24h observe + safe ff when behind)",
     )
     parser.add_argument(
         "--help-json",
@@ -2515,8 +2671,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("pin", help="Pin catalog to current HEAD")
     p.add_argument("name", nargs="?", help="Single repo")
+    p.add_argument(
+        "--here",
+        action="store_true",
+        help="Pin the catalog entry for the current directory (for git hooks)",
+    )
+    p.add_argument(
+        "--quiet",
+        action="store_true",
+        help="No stdout; failures log to ~/.git-updater/logs/hook-pin.log",
+    )
     p.add_argument("--export", action="store_true", help="Also write vendor.lock")
     p.set_defaults(func=cmd_pin)
+
+    p = sub.add_parser(
+        "hook-sync",
+        help="Install git hooks that run pin --here after commit/pull/rebase/checkout",
+    )
+    p.add_argument("name", nargs="?", help="Single repo")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Append pin hooks even when a foreign hook file exists",
+    )
+    p.set_defaults(func=cmd_hook_sync)
 
     p = sub.add_parser("install", help="Clone missing repos and run install hooks")
     p.add_argument("name", nargs="?", help="Single repo")
@@ -2614,10 +2792,7 @@ def main(argv: list[str] | None = None) -> None:
     args.func(args)
     if args.no_self_check or args.command in SKIP_SELF_CHECK_COMMANDS:
         return
-    if args.command in AUTO_SELF_UPDATE_COMMANDS:
-        maybe_apply_self_update()
-    else:
-        maybe_warn_self_update()
+    maybe_apply_self_update()
 
 
 if __name__ == "__main__":

@@ -134,6 +134,17 @@ git-updater verify          # exit 1 if any clone != lock (CI gate)
 
 Dirty or diverged repos are **never** force-reset. Use `consolidate` when `update` stops at diverged/ff-only failures, then `pin`.
 
+## Lock-step with plain `git pull` / `git push`
+
+Cursor, GitHub Desktop, and raw `git` do not update the catalog. Install per-clone hooks once:
+
+```powershell
+git-updater hook-sync              # all catalog repos
+git-updater hook-sync agent-memory # one repo
+```
+
+`adopt` and `add` install these hooks automatically. Each hook runs `git-updater pin --here --quiet` after commit, merge (pull), rebase/amend, or branch checkout. Failures log to `~/.git-updater/logs/hook-pin.log` and never block git. Hooks are per-repo (not global `core.hooksPath`). Foreign hook files are skipped unless `--force` (appends the pin block). `vendor.lock` is still explicit: `pin --export` / `export`.
+
 ## Remote URLs
 
 | Form | Example |
@@ -205,6 +216,8 @@ See [`git-updater.schema.json`](git-updater.schema.json) for the JSON shape.
 | `consolidate --abort [NAME]` | Abort in-progress merge/rebase |
 | `push [NAME]` | Push branch |
 | `pin [NAME] [--export]` | Pin to HEAD |
+| `pin --here [--quiet]` | Pin catalog row for cwd (git hooks) |
+| `hook-sync [NAME] [--force]` | Install pin hooks in catalog clones |
 | `install [NAME]` | Clone missing + checkout pin + install hooks |
 | `export [--out PATH]` | Write vendor.lock + VENDOR.md |
 | `replicate LOCK [--root PATH] [--dry-run]` | Bootstrap from lock |
@@ -215,7 +228,7 @@ See [`git-updater.schema.json`](git-updater.schema.json) for the JSON shape.
 | `help [CMD] [--json]` | Human or JSON help |
 | `man [--write FILE]` | Print / write roff man page |
 
-Global: `--no-self-check` skips automatic self-update after `update` / `install` / `replicate` / `consolidate`. `--help-json` prints the CLI spec and exits.
+Global: `--no-self-check` skips the 24h residual self-update. `--help-json` prints the CLI spec and exits.
 
 ## vendor.lock format (v1)
 
@@ -270,9 +283,7 @@ git-updater self-check --fetch        # force fresh compare
 git-updater self-update               # ff-only + `python -m pip install -e .`
 ```
 
-After `update` / `install` / `replicate` / `consolidate`, self-update runs automatically if the checkout is clean and behind. Dirty or diverged trees are left alone. Disable with `--no-self-check` or `GIT_UPDATER_SKIP_SELF_CHECK=1`.
-
-Other commands still print a one-line hint when an update is cached as available.
+After other commands, git-updater **observes** remotes at most once per 24h. If that observe shows a clean fast-forward residual, it patches (ff-only + reinstall). Within the TTL it only prints a hint from cache. Dirty or diverged trees are left alone. Disable with `--no-self-check` or `GIT_UPDATER_SKIP_SELF_CHECK=1`. `self-update` always observes and patches.
 
 Detection order:
 

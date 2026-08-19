@@ -498,6 +498,44 @@ class SelfCheckTests(unittest.TestCase):
         gu.maybe_apply_self_update()
         mock_apply.assert_not_called()
 
+    @mock.patch("git_updater.apply_self_update")
+    @mock.patch("git_updater.check_self")
+    @mock.patch("git_updater.maybe_warn_self_update")
+    def test_maybe_apply_skips_patch_when_cache_fresh(
+        self,
+        mock_warn: mock.Mock,
+        mock_check: mock.Mock,
+        mock_apply: mock.Mock,
+    ) -> None:
+        recent = {"checked_at": datetime.now(timezone.utc).isoformat()}
+        with mock.patch("git_updater.load_self_check_cache", return_value=recent):
+            gu.maybe_apply_self_update()
+        mock_apply.assert_not_called()
+        mock_check.assert_not_called()
+        mock_warn.assert_called_once()
+
+    @mock.patch("git_updater.apply_self_update")
+    @mock.patch("git_updater.check_self")
+    def test_maybe_apply_patches_when_cache_stale_and_behind(
+        self,
+        mock_check: mock.Mock,
+        mock_apply: mock.Mock,
+    ) -> None:
+        behind = gu.SelfCheckResult(
+            install_path=Path("/tmp/git-updater"),
+            remote="acme/git-updater",
+            branch="main",
+            local_commit="a" * 40,
+            remote_commit="b" * 40,
+            status="behind",
+            sync_ref="origin/main",
+        )
+        mock_check.return_value = behind
+        with mock.patch("git_updater.load_self_check_cache", return_value=None):
+            gu.maybe_apply_self_update()
+        mock_check.assert_called_once_with(fetch=True, use_cache=False)
+        mock_apply.assert_called_once_with(interactive=False, observed=behind)
+
 
 class GithubProjectIdentityTests(unittest.TestCase):
     def test_same_repo_name_different_owner_is_not_the_same_clone(self) -> None:
@@ -737,6 +775,76 @@ class SkillInstallTests(unittest.TestCase):
             agents = home / ".agents" / "skills" / "git-updater" / "SKILL.md"
             self.assertTrue(cursor.is_file())
             self.assertTrue(agents.is_file())
+
+
+class PinHookTests(unittest.TestCase):
+    def test_catalog_entry_for_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "app"
+            repo.mkdir()
+            catalog = gu.Catalog(
+                version=1,
+                root=str(root),
+                repos=[
+                    gu.RepoEntry(
+                        name="app",
+                        remote="o/app",
+                        url="https://github.com/o/app.git",
+                        path="app",
+                        branch="main",
+                        commit="a" * 40,
+                    )
+                ],
+            )
+            self.assertIs(gu.catalog_entry_for_path(catalog, repo), catalog.repos[0])
+            self.assertIsNone(gu.catalog_entry_for_path(catalog, root / "other"))
+
+    def test_pin_hook_script_post_checkout(self) -> None:
+        text = gu.pin_hook_script("post-checkout", "git-updater")
+        self.assertIn(gu.PIN_HOOK_MARKER, text)
+        self.assertIn('if [ "$1" = "$2" ]; then exit 0; fi', text)
+        self.assertIn("pin --here --quiet", text)
+
+    def test_install_pin_hooks_writes_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            hooks = repo / ".git" / "hooks"
+            hooks.mkdir(parents=True)
+            installed, skipped = gu.install_pin_hooks(repo)
+            self.assertEqual(installed, list(gu.PIN_HOOK_NAMES))
+            self.assertEqual(skipped, [])
+            for name in gu.PIN_HOOK_NAMES:
+                content = (hooks / name).read_text(encoding="utf-8")
+                self.assertIn(gu.PIN_HOOK_MARKER, content)
+
+    def test_install_pin_hooks_skips_foreign_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            hooks = repo / ".git" / "hooks"
+            hooks.mkdir(parents=True)
+            (hooks / "post-commit").write_text("#!/bin/sh\necho custom\n", encoding="utf-8")
+            installed, skipped = gu.install_pin_hooks(repo)
+            self.assertNotIn("post-commit", installed)
+            self.assertIn("post-commit (foreign hook)", skipped)
+            self.assertEqual((hooks / "post-commit").read_text(encoding="utf-8"), "#!/bin/sh\necho custom\n")
+            self.assertTrue(installed)
+
+    @mock.patch("git_updater.save_catalog")
+    @mock.patch("git_updater.pin_entry", return_value=True)
+    @mock.patch("git_updater.catalog_entry_for_path")
+    def test_pin_here_quiet_on_missing(
+        self,
+        mock_lookup: mock.Mock,
+        mock_pin: mock.Mock,
+        _save: mock.Mock,
+    ) -> None:
+        mock_lookup.return_value = None
+        with mock.patch("git_updater.load_catalog", return_value=gu.Catalog(version=1, root="/tmp", repos=[])):
+            with mock.patch("git_updater.log_hook_pin") as log:
+                gu.cmd_pin(argparse_namespace(here=True, quiet=True, name=None, export=False))
+        log.assert_called_once()
+        mock_pin.assert_not_called()
 
 
 class InitBootstrapTests(unittest.TestCase):

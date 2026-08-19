@@ -15,7 +15,7 @@ Machine-readable help:
 .SH OPTIONS
 .TP
 .B --no-self-check
-Skip automatic self-update after update/install/replicate/consolidate (default: False)
+Skip residual self-update (24h observe + safe ff when behind) (default: False)
 .TP
 .B --help-json
 Print machine-readable CLI spec as JSON and exit (default: False)
@@ -83,7 +83,18 @@ Pin catalog to current HEAD
 .br
 name (optional) Single repo
 .br
+--here  Pin the catalog entry for the current directory (for git hooks)
+.br
+--quiet  No stdout; failures log to ~/.git-updater/logs/hook-pin.log
+.br
 --export  Also write vendor.lock
+.TP
+.B hook-sync
+Install git hooks that run pin --here after commit/pull/rebase/checkout
+.br
+name (optional) Single repo
+.br
+--force  Append pin hooks even when a foreign hook file exists
 .TP
 .B install
 Clone missing repos and run install hooks

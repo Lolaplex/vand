@@ -60,9 +60,14 @@ git-updater consolidate         # merge when ff-only cannot; --rebase optional
 git-updater consolidate --continue NAME
 git-updater push
 git-updater pin --export        # after local commits you want in the lock
+git-updater hook-sync           # install pin hooks in all catalog clones (once)
 ```
 
 Dirty/diverged: leave them. Tell the user. Do not invent a reset.
+
+## Lock-step (git hooks)
+
+Plain `git pull` / commit / rebase does not update the catalog. `hook-sync` installs per-repo hooks that call `pin --here --quiet`. `adopt` / `add` run this automatically. Failures go to `~/.git-updater/logs/hook-pin.log`. Do not set global `core.hooksPath`. Do not auto-export `vendor.lock` from hooks.
 
 ## Catalog vs lock
 
@@ -91,7 +96,7 @@ verify: python -m unittest discover -s tests -v
 
 Different remotes are allowed. Identity is the **commit SHA**, not the GitHub repo name.
 
-`update` / `push` still use `origin`. `self-update` may fast-forward another configured remote only if `HEAD` is an ancestor of that remote's branch tip (same history, extra commits). It then runs the update hook (`pip install -e .`) so PATH stays on this checkout.
+`update` / `push` still use `origin`. `self-update` may fast-forward another configured remote only if `HEAD` is an ancestor of that remote's branch tip (same history, extra commits). It then runs the update hook (`pip install -e .`) so PATH stays on this checkout. After other commands, git-updater observes at most once per 24h and patches only when that residual is a clean fast-forward.
 
 A personal fork and an org copy (`you/app` vs `Lolaplex/app`) are not the same project just because the name matches. Add the org remote (or set origin to it) so the pin can be fetched:
 
