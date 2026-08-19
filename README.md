@@ -49,11 +49,11 @@ git-updater --help-json         # full spec: commands, flags, args, defaults
 git-updater --help-json replicate
 git-updater help --json
 git-updater help replicate --json
-git-updater man                 # roff man page on stdout (also: man/git-updater.1)
-git-updater man --write man/git-updater.1
+git-updater man                 # roff man page on stdout (generated from argparse)
+git-updater man --write FILE    # write that roff locally; not committed
 ```
 
-`--help-json` is generated from argparse, so it cannot drift from the real CLI. On Unix: `git-updater man | groff -man -Tutf8 | less` or install `man/git-updater.1` on `MANPATH`.
+`--help-json` and `man` are generated from argparse, so they cannot drift from the real CLI. On Unix: `git-updater man | groff -man -Tutf8 | less`. Do not commit `man/` or `.cursor/` copies.
 
 ## Quick start
 
@@ -136,14 +136,31 @@ Dirty or diverged repos are **never** force-reset. Use `consolidate` when `updat
 
 ## Lock-step with plain `git pull` / `git push`
 
-Cursor, GitHub Desktop, and raw `git` do not update the catalog. Install per-clone hooks once:
+`update`, `push`, `pin`, and `consolidate` write HEAD into `~/.git-updater/catalog.json`. Cursor Source Control, GitHub Desktop, and raw `git` do not. `hook-sync` installs **per-clone** Git hooks that re-pin after those events.
 
 ```powershell
-git-updater hook-sync              # all catalog repos
-git-updater hook-sync agent-memory # one repo
+git-updater hook-sync                 # all catalog repos
+git-updater hook-sync agent-memory    # one repo
+git-updater pin --here                # pin the catalog row for cwd
+git-updater pin --here --quiet        # same, for hooks (no stdout)
 ```
 
-`adopt` and `add` install these hooks automatically. Each hook runs `git-updater pin --here --quiet` after commit, merge (pull), rebase/amend, or branch checkout. Failures log to `~/.git-updater/logs/hook-pin.log` and never block git. Hooks are per-repo (not global `core.hooksPath`). Foreign hook files are skipped unless `--force` (appends the pin block). `vendor.lock` is still explicit: `pin --export` / `export`.
+`adopt` and `add` run `hook-sync` on the new clone. Existing catalog entries need one `hook-sync` after upgrade.
+
+| Hook | When it runs |
+|------|----------------|
+| `post-commit` | Local commit |
+| `post-merge` | `git pull` that fast-forwards or merges |
+| `post-rewrite` | Rebase / amend |
+| `post-checkout` | Branch switch, only when HEAD actually changed |
+
+Each hook runs `git-updater pin --here --quiet`. That looks up the catalog row by this clone's path and sets `commit` (and branch) to HEAD. Failures append to `~/.git-updater/logs/hook-pin.log` and **never** fail the git command (`|| true`).
+
+`git push` does not move HEAD. Commit/pull already pinned the SHA; `status --fetch` is enough to see whether origin is caught up.
+
+Do not set global `core.hooksPath` (Git replaces per-repo hooks instead of chaining). Do not alias `git`. Do not auto-export `vendor.lock` from hooks (`pin --export` / `export` stay explicit). Foreign hook files are left alone unless `--force` (appends the pin block after the existing script).
+
+`desktop-commander` is the later scheduler clock (`git-updater update` at 09:00). Hooks are the residual patch for ad-hoc git in the working tree.
 
 ## Remote URLs
 
@@ -196,6 +213,8 @@ See [`git-updater.schema.json`](git-updater.schema.json) for the JSON shape.
 |------|---------|
 | `~/.git-updater/catalog.json` | Your curated repo list (private to this machine, includes local clone root) |
 | `~/.git-updater/logs/` | Timestamped logs from update/install/replicate |
+| `~/.git-updater/logs/hook-pin.log` | Quiet pin failures from git hooks |
+| `<clone>/.git/hooks/` | Pin hooks installed by `hook-sync` (not in the clone's tree) |
 | `<clone-root>/vendor.lock` | Shareable pin snapshot (relative paths only; no machine root) |
 | `<clone-root>/VENDOR.md` | Human-readable vendor table |
 
@@ -215,9 +234,9 @@ See [`git-updater.schema.json`](git-updater.schema.json) for the JSON shape.
 | `consolidate --continue [NAME]` | Finish merge/rebase after fixing conflicts |
 | `consolidate --abort [NAME]` | Abort in-progress merge/rebase |
 | `push [NAME]` | Push branch |
-| `pin [NAME] [--export]` | Pin to HEAD |
-| `pin --here [--quiet]` | Pin catalog row for cwd (git hooks) |
-| `hook-sync [NAME] [--force]` | Install pin hooks in catalog clones |
+| `pin [NAME] [--export]` | Pin named repo (or all) to HEAD |
+| `pin --here [--quiet]` | Pin catalog row for cwd; `--quiet` logs instead of exiting |
+| `hook-sync [NAME] [--force]` | Install pin hooks; `--force` appends onto foreign hook files |
 | `install [NAME]` | Clone missing + checkout pin + install hooks |
 | `export [--out PATH]` | Write vendor.lock + VENDOR.md |
 | `replicate LOCK [--root PATH] [--dry-run]` | Bootstrap from lock |

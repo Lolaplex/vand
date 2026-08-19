@@ -5,8 +5,9 @@ __pycache__/
 .venv/
 venv/
 .agents/
-.cursor/rules/
+.cursor/
 build/
 dist/
 *.egg-info/
 .eggs/
+man/

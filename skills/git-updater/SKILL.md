@@ -67,7 +67,16 @@ Dirty/diverged: leave them. Tell the user. Do not invent a reset.
 
 ## Lock-step (git hooks)
 
-Plain `git pull` / commit / rebase does not update the catalog. `hook-sync` installs per-repo hooks that call `pin --here --quiet`. `adopt` / `add` run this automatically. Failures go to `~/.git-updater/logs/hook-pin.log`. Do not set global `core.hooksPath`. Do not auto-export `vendor.lock` from hooks.
+Plain `git pull` / commit / rebase does not update the catalog. `hook-sync` installs per-repo hooks:
+
+| Hook | Event |
+|------|--------|
+| `post-commit` | commit |
+| `post-merge` | pull merge / ff |
+| `post-rewrite` | rebase / amend |
+| `post-checkout` | checkout when HEAD changed |
+
+Each runs `git-updater pin --here --quiet` (`|| true`). Lookup is by clone path. Failures: `~/.git-updater/logs/hook-pin.log`. `adopt` / `add` install hooks; existing clones need `git-updater hook-sync` once. `--force` appends onto a foreign hook file. Do not set global `core.hooksPath`. Do not auto-export `vendor.lock`. `git push` does not change HEAD.
 
 ## Catalog vs lock
 
@@ -117,4 +126,4 @@ Do not `git remote add origin` (that name is taken). Needs org write access to p
 
 ## Agent files
 
-This repo ships `skills/git-updater/SKILL.md`. First `init` copies it to `~/.cursor/skills/git-updater/` and `~/.agents/skills/git-updater/` (paths block filled with this checkout). `AGENTS.md` is the install spec. Reload Cursor after first install.
+This repo ships `skills/git-updater/SKILL.md`. First `init` copies it to `~/.cursor/skills/git-updater/` and `~/.agents/skills/git-updater/` (paths block filled with this checkout). `AGENTS.md` is the install spec. Reload Cursor after first install. In-repo `.cursor/` and `man/` are generated / local copies — gitignored, not the source of truth.

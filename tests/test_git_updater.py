@@ -728,6 +728,8 @@ class HelpSpecTests(unittest.TestCase):
         self.assertIn("help", names)
         self.assertIn("man", names)
         self.assertIn("install-skills", names)
+        self.assertIn("hook-sync", names)
+        self.assertIn("pin", names)
         flags = {f for opt in spec["options"] for f in opt.get("flags", [])}
         self.assertIn("--help-json", flags)
         init = next(c for c in spec["commands"] if c["name"] == "init")
