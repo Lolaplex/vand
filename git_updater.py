@@ -2655,7 +2655,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "sync-hooks",
-        help="Refresh install/update hooks from each repo's .git-updater manifest",
+        help="Refresh catalog install/update commands from each repo's .git-updater manifest",
     )
     p.add_argument("name", nargs="?", help="Single repo")
     p.set_defaults(func=cmd_sync_hooks)
@@ -2775,7 +2775,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="Print CLI spec as JSON")
     p.set_defaults(func=cmd_help)
 
-    p = sub.add_parser("man", help="Print man page (roff) to stdout")
+    p = sub.add_parser("man", help="Print roff man page generated from argparse")
     p.add_argument("--write", help="Write roff to this file instead of stdout")
     p.set_defaults(func=cmd_man)
 

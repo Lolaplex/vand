@@ -43,17 +43,21 @@ Without installing, you can still run `python git_updater.py` or `git-updater.cm
 
 Human `--help` is a wall of text. Agents and other tools should not scrape it.
 
+**All machine-readable help is generated from argparse at runtime** — there is no committed man page or JSON spec in the repo. If you add a flag or command, `--help-json` and `man` update automatically.
+
 ```powershell
 git-updater --help              # people
 git-updater --help-json         # full spec: commands, flags, args, defaults
 git-updater --help-json replicate
 git-updater help --json
 git-updater help replicate --json
-git-updater man                 # roff man page on stdout (generated from argparse)
-git-updater man --write FILE    # write that roff locally; not committed
+git-updater man                 # roff on stdout (generated; same source as --help-json)
+git-updater man --write FILE    # optional local copy, e.g. man/git-updater.1 for groff
 ```
 
-`--help-json` and `man` are generated from argparse, so they cannot drift from the real CLI. On Unix: `git-updater man | groff -man -Tutf8 | less`. Do not commit `man/` or `.cursor/` copies.
+On Unix: `git-updater man | groff -man -Tutf8 | less`. Optional: `git-updater man --write man/git-updater.1` then `MANPATH=man man git-updater`.
+
+Do **not** commit `man/` or in-repo `.cursor/` skill copies — both are gitignored local output. Source of truth: `git_updater.py` (argparse) and `skills/git-updater/SKILL.md`.
 
 ## Quick start
 
@@ -129,6 +133,7 @@ git-updater consolidate --abort NAME      # abort stuck merge/rebase
 git-updater push            # push tracking branches; re-pin HEAD
 git-updater pin             # pin catalog to current HEAD after local commits
 git-updater pin --export    # pin + write vendor.lock
+git-updater hook-sync       # once: install git hooks so plain git keeps catalog pinned
 git-updater verify          # exit 1 if any clone != lock (CI gate)
 ```
 
@@ -136,19 +141,30 @@ Dirty or diverged repos are **never** force-reset. Use `consolidate` when `updat
 
 ## Lock-step with plain `git pull` / `git push`
 
-`update`, `push`, `pin`, and `consolidate` write HEAD into `~/.git-updater/catalog.json`. Cursor Source Control, GitHub Desktop, and raw `git` do not. `hook-sync` installs **per-clone** Git hooks that re-pin after those events.
+`update`, `push`, `pin`, and `consolidate` write HEAD into `~/.git-updater/catalog.json`. Your Agent, GitHub Desktop, and raw `git` do not.
+
+### Two different “hooks”
+
+| Command | What it syncs | Where |
+|---------|----------------|-------|
+| **`sync-hooks`** | **Manifest** install/update shell commands from each repo's `.git-updater.yaml` into the catalog | `catalog.json` fields |
+| **`hook-sync`** | **Git** hooks that re-pin the catalog after commit / pull / rebase / checkout | `<clone>/.git/hooks/` |
+
+Do not confuse them. `sync-hooks` does not install pin hooks. `hook-sync` does not read manifests.
+
+### Pin hooks (`hook-sync`)
 
 ```powershell
 git-updater hook-sync                 # all catalog repos
 git-updater hook-sync agent-memory    # one repo
-git-updater pin --here                # pin the catalog row for cwd
-git-updater pin --here --quiet        # same, for hooks (no stdout)
+git-updater pin --here                # pin the catalog row for cwd (manual test)
+git-updater pin --here --quiet        # same, used inside git hooks
 ```
 
-`adopt` and `add` run `hook-sync` on the new clone. Existing catalog entries need one `hook-sync` after upgrade.
+`adopt` and `add` run `hook-sync` on the new clone. **Existing catalog entries:** run `hook-sync` once after upgrading git-updater.
 
-| Hook | When it runs |
-|------|----------------|
+| Git hook | When it runs |
+|----------|----------------|
 | `post-commit` | Local commit |
 | `post-merge` | `git pull` that fast-forwards or merges |
 | `post-rewrite` | Rebase / amend |
@@ -156,11 +172,13 @@ git-updater pin --here --quiet        # same, for hooks (no stdout)
 
 Each hook runs `git-updater pin --here --quiet`. That looks up the catalog row by this clone's path and sets `commit` (and branch) to HEAD. Failures append to `~/.git-updater/logs/hook-pin.log` and **never** fail the git command (`|| true`).
 
+**Prerequisites:** clone must be in the catalog (`adopt` / `add` / `init`). `git-updater` must be on PATH (or the hook falls back to `py -3` / `python` + this checkout's `git_updater.py`).
+
 `git push` does not move HEAD. Commit/pull already pinned the SHA; `status --fetch` is enough to see whether origin is caught up.
 
 Do not set global `core.hooksPath` (Git replaces per-repo hooks instead of chaining). Do not alias `git`. Do not auto-export `vendor.lock` from hooks (`pin --export` / `export` stay explicit). Foreign hook files are left alone unless `--force` (appends the pin block after the existing script).
 
-`desktop-commander` is the later scheduler clock (`git-updater update` at 09:00). Hooks are the residual patch for ad-hoc git in the working tree.
+`desktop-commander` is the later scheduler clock (`git-updater update` at 09:00). Pin hooks are the residual patch for ad-hoc git in the working tree.
 
 ## Remote URLs
 
@@ -225,8 +243,8 @@ See [`git-updater.schema.json`](git-updater.schema.json) for the JSON shape.
 | `init [--root PATH]` | First-run: catalog, pip -e, skills, adopt self, replicate `examples/shared.lock` |
 | `scan` | Git folders under root not in catalog |
 | `add owner/repo [--install CMD]` | Clone + register |
-| `adopt FOLDER [--install CMD]` | Register existing clone (auto-reads manifest) |
-| `sync-hooks [NAME]` | Refresh install/update from repo manifests |
+| `adopt FOLDER [--install CMD]` | Register existing clone (auto-reads manifest; runs `hook-sync`) |
+| `sync-hooks [NAME]` | Refresh catalog **install/update commands** from repo manifests (not git hooks) |
 | `rm NAME` | Remove from catalog (keeps folder) |
 | `status [NAME] [--fetch]` | pinned / behind / ahead / dirty / diverged / missing |
 | `update [NAME]` | Fetch; ff-only if clean |
@@ -235,8 +253,8 @@ See [`git-updater.schema.json`](git-updater.schema.json) for the JSON shape.
 | `consolidate --abort [NAME]` | Abort in-progress merge/rebase |
 | `push [NAME]` | Push branch |
 | `pin [NAME] [--export]` | Pin named repo (or all) to HEAD |
-| `pin --here [--quiet]` | Pin catalog row for cwd; `--quiet` logs instead of exiting |
-| `hook-sync [NAME] [--force]` | Install pin hooks; `--force` appends onto foreign hook files |
+| `pin --here [--quiet]` | Pin catalog row for cwd; `--quiet` for git hooks (logs on failure) |
+| `hook-sync [NAME] [--force]` | Install **git** pin hooks in `.git/hooks/` |
 | `install [NAME]` | Clone missing + checkout pin + install hooks |
 | `export [--out PATH]` | Write vendor.lock + VENDOR.md |
 | `replicate LOCK [--root PATH] [--dry-run]` | Bootstrap from lock |
@@ -244,8 +262,8 @@ See [`git-updater.schema.json`](git-updater.schema.json) for the JSON shape.
 | `self-check [--fetch] [--json]` | Check if git-updater itself is up to date |
 | `self-update` | Fast-forward this checkout (only refs that are descendants of HEAD) + reinstall |
 | `install-skills` | Copy agent skill to `~/.cursor/skills` and `~/.agents/skills` |
-| `help [CMD] [--json]` | Human or JSON help |
-| `man [--write FILE]` | Print / write roff man page |
+| `help [CMD] [--json]` | Human or JSON help (JSON generated from argparse) |
+| `man [--write FILE]` | Print / write roff man page (generated from argparse; not in repo) |
 
 Global: `--no-self-check` skips the 24h residual self-update. `--help-json` prints the CLI spec and exits.
 

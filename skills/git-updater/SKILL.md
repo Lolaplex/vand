@@ -8,7 +8,7 @@ description: Catalog git clones, pin SHAs in vendor.lock, replicate stacks, adop
 Python 3 stdlib CLI. Pins **whole repos** on a machine (not npm/pip lockfiles inside one project).
 
 <!-- git-updater-paths -->
-First install from this clone: `python git_updater.py init --root <clone-root>`. That does pip -e, skills, catalog, adopt self, and `examples/shared.lock`. After that, invoke `git-updater` on PATH. Fallback: `python git_updater.py`. Machine-readable spec: `git-updater --help-json`.
+First install from this clone: `python git_updater.py init --root <clone-root>`. That does pip -e, skills, catalog, adopt self, and `examples/shared.lock`. After that, invoke `git-updater` on PATH. Fallback: `python git_updater.py`. Machine-readable spec: `git-updater --help-json` (generated from argparse; same source as `git-updater man`).
 <!-- /git-updater-paths -->
 
 ## Always
@@ -26,7 +26,8 @@ First install from this clone: `python git_updater.py init --root <clone-root>`.
 | `~/.git-updater/logs/` | Timestamped command logs |
 | `<clone-root>/vendor.lock` | Shareable SHA pins |
 | `<clone-root>/VENDOR.md` | Human table |
-| `<repo>/.git-updater.yaml` | Install/update/verify hooks in the repo |
+| `<repo>/.git-updater.yaml` | Manifest: install/update/verify **shell commands** (not git hooks) |
+| `<clone>/.git/hooks/` | Git pin hooks from `hook-sync` (calls `pin --here --quiet`) |
 
 ## When this skill fires
 
@@ -65,12 +66,17 @@ git-updater hook-sync           # install pin hooks in all catalog clones (once)
 
 Dirty/diverged: leave them. Tell the user. Do not invent a reset.
 
-## Lock-step (git hooks)
+## Lock-step (git pin hooks)
 
-Plain `git pull` / commit / rebase does not update the catalog. `hook-sync` installs per-repo hooks:
+Plain `git pull` / commit / rebase does not update the catalog. **`hook-sync`** installs git hooks in `.git/hooks/`. Do not confuse with **`sync-hooks`** (manifest install/update commands → catalog).
 
-| Hook | Event |
-|------|--------|
+| Command | Syncs |
+|---------|--------|
+| `sync-hooks` | `.git-updater.yaml` install/update → `catalog.json` |
+| `hook-sync` | git hooks → `pin --here --quiet` after git events |
+
+| Git hook | Event |
+|----------|--------|
 | `post-commit` | commit |
 | `post-merge` | pull merge / ff |
 | `post-rewrite` | rebase / amend |
@@ -126,4 +132,4 @@ Do not `git remote add origin` (that name is taken). Needs org write access to p
 
 ## Agent files
 
-This repo ships `skills/git-updater/SKILL.md`. First `init` copies it to `~/.cursor/skills/git-updater/` and `~/.agents/skills/git-updater/` (paths block filled with this checkout). `AGENTS.md` is the install spec. Reload Cursor after first install. In-repo `.cursor/` and `man/` are generated / local copies — gitignored, not the source of truth.
+This repo ships `skills/git-updater/SKILL.md`. First `init` copies it to `~/.cursor/skills/git-updater/` and `~/.agents/skills/git-updater/` (paths block filled with this checkout). `AGENTS.md` is the install spec. Reload your Agent after first install. In-repo `.cursor/` and `man/` are generated / local copies — gitignored, not the source of truth.

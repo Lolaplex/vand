@@ -752,7 +752,8 @@ class HelpSpecTests(unittest.TestCase):
         self.assertIn(".TH GIT-UPDATER 1", man)
         self.assertIn("git-updater", man)
         self.assertIn(".B init", man)
-        self.assertIn("--help-json", man)
+        self.assertIn("hook-sync", man)
+        self.assertIn("pin --here", man)
 
 
 class SkillInstallTests(unittest.TestCase):
