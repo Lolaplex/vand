@@ -1,9 +1,9 @@
-# Machine-readable hooks for vend.
+# Machine-readable hooks for vand.
 version: 1
 install:
   - python -m pip install -e .
-  - python vend.py install-skills
+  - python vand.py install-skills
 update:
   - python -m pip install -e .
-  - python vend.py install-skills
+  - python vand.py install-skills
 verify: python -m unittest discover -s tests -v

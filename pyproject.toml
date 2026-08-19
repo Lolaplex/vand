@@ -3,17 +3,17 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vend"
+name = "vand"
 version = "0.1.0"
-description = "Catalog source instances, pin revisions in vend.lock, replicate stacks."
+description = "Catalog source instances, pin revisions in vand.lock, replicate stacks."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
-authors = [{ name = "vend contributors" }]
+authors = [{ name = "vand contributors" }]
 
 [project.scripts]
-vend = "vend:main"
+vand = "vand:main"
 
 [tool.setuptools]
-py-modules = ["vend"]
+py-modules = ["vand"]
 
