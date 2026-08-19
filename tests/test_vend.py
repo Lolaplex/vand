@@ -1,4 +1,4 @@
-"""Tests for git_updater."""
+"""Tests for vend."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-import git_updater as gu
+import vend as gu
 
 
 class ParseRepoSpecTests(unittest.TestCase):
@@ -167,27 +167,27 @@ class StatusClassificationTests(unittest.TestCase):
         )
         self.catalog.repos.append(self.entry)
 
-    @mock.patch("git_updater.repo_abs_path")
-    @mock.patch("git_updater.is_dirty", return_value=False)
-    @mock.patch("git_updater.current_commit", return_value="a" * 40)
-    @mock.patch("git_updater.current_branch", return_value="main")
-    @mock.patch("git_updater.pin_fetch_remote_names", return_value=["origin"])
-    @mock.patch("git_updater.pick_sync_ref", return_value=(None, "current"))
-    @mock.patch("git_updater.remote_ahead_behind", return_value=(0, 0))
+    @mock.patch("vend.repo_abs_path")
+    @mock.patch("vend.is_dirty", return_value=False)
+    @mock.patch("vend.current_commit", return_value="a" * 40)
+    @mock.patch("vend.current_branch", return_value="main")
+    @mock.patch("vend.pin_fetch_remote_names", return_value=["origin"])
+    @mock.patch("vend.pick_sync_ref", return_value=(None, "current"))
+    @mock.patch("vend.remote_ahead_behind", return_value=(0, 0))
     def test_pinned(self, *_m: mock.Mock) -> None:
         with mock.patch("pathlib.Path.exists", return_value=True):
             with mock.patch("pathlib.Path.__truediv__", return_value=mock.Mock(exists=lambda: True)):
                 status = gu.classify_repo(self.catalog, self.entry, fetch=True)
         self.assertEqual(status, "pinned")
 
-    @mock.patch("git_updater.repo_abs_path")
-    @mock.patch("git_updater.is_dirty", return_value=True)
+    @mock.patch("vend.repo_abs_path")
+    @mock.patch("vend.is_dirty", return_value=True)
     def test_dirty(self, *_m: mock.Mock) -> None:
         with mock.patch("pathlib.Path.exists", return_value=True):
             status = gu.classify_repo(self.catalog, self.entry)
         self.assertEqual(status, "dirty")
 
-    @mock.patch("git_updater.repo_abs_path")
+    @mock.patch("vend.repo_abs_path")
     def test_missing(self, mock_path: mock.Mock) -> None:
         mock_path.return_value = Path("/nonexistent/t")
         status = gu.classify_repo(self.catalog, self.entry)
@@ -217,7 +217,7 @@ class ReplicateDryRunTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with mock.patch("git_updater.clone_repo") as clone:
+            with mock.patch("vend.clone_repo") as clone:
                 with mock.patch("builtins.print"):
                     gu.cmd_replicate(
                         argparse_namespace(lockfile=str(lock), root=tmp, dry_run=True)
@@ -226,19 +226,19 @@ class ReplicateDryRunTests(unittest.TestCase):
 
 
 class ConsolidateTests(unittest.TestCase):
-    @mock.patch("git_updater.run_install")
-    @mock.patch("git_updater.run_git")
-    @mock.patch("git_updater.attach_entry_remotes")
-    @mock.patch("git_updater.fetch_all_remotes")
-    @mock.patch("git_updater.pin_fetch_remote_names", return_value=["origin"])
-    @mock.patch("git_updater.pick_sync_ref", return_value=(None, "diverged"))
-    @mock.patch("git_updater.is_dirty", return_value=False)
-    @mock.patch("git_updater.current_branch", return_value="main")
-    @mock.patch("git_updater.current_commit", return_value="c" * 40)
-    @mock.patch("git_updater.merge_in_progress", return_value=False)
-    @mock.patch("git_updater.rebase_in_progress", return_value=False)
-    @mock.patch("git_updater.list_conflicts", return_value=["conflicted.txt"])
-    @mock.patch("git_updater.repo_abs_path")
+    @mock.patch("vend.run_install")
+    @mock.patch("vend.run_git")
+    @mock.patch("vend.attach_entry_remotes")
+    @mock.patch("vend.fetch_all_remotes")
+    @mock.patch("vend.pin_fetch_remote_names", return_value=["origin"])
+    @mock.patch("vend.pick_sync_ref", return_value=(None, "diverged"))
+    @mock.patch("vend.is_dirty", return_value=False)
+    @mock.patch("vend.current_branch", return_value="main")
+    @mock.patch("vend.current_commit", return_value="c" * 40)
+    @mock.patch("vend.merge_in_progress", return_value=False)
+    @mock.patch("vend.rebase_in_progress", return_value=False)
+    @mock.patch("vend.list_conflicts", return_value=["conflicted.txt"])
+    @mock.patch("vend.repo_abs_path")
     def test_merge_conflict(
         self,
         mock_path: mock.Mock,
@@ -262,7 +262,7 @@ class ConsolidateTests(unittest.TestCase):
                 raise subprocess.CalledProcessError(1, "git")
             return mock.Mock(stdout="", returncode=0)
 
-        with mock.patch("git_updater.run_git", side_effect=run_git_side_effect):
+        with mock.patch("vend.run_git", side_effect=run_git_side_effect):
             with mock.patch("pathlib.Path.exists", return_value=True):
                 outcome, _ = gu.consolidate_repo(
                     catalog, entry, strategy="merge", mode="default"
@@ -281,7 +281,7 @@ class ManifestTests(unittest.TestCase):
 
     def test_load_manifest_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / ".git-updater.json"
+            path = Path(tmp) / "vend.json"
             path.write_text(
                 json.dumps({"install": "make setup", "update": "make setup"}),
                 encoding="utf-8",
@@ -301,7 +301,7 @@ class ManifestTests(unittest.TestCase):
     def test_resolve_prefers_catalog_over_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / ".git-updater.yaml").write_text("install: from-manifest\n", encoding="utf-8")
+            (root / "vend.yml").write_text("install: from-manifest\n", encoding="utf-8")
             entry = gu.RepoEntry(
                 name="t",
                 remote="o/t",
@@ -357,8 +357,8 @@ class SelfCheckTests(unittest.TestCase):
 
     def test_format_self_check_behind(self) -> None:
         result = gu.SelfCheckResult(
-            install_path=Path("C:/tools/git-updater"),
-            remote="acme/git-updater",
+            install_path=Path("C:/tools/vend"),
+            remote="acme/vend",
             branch="main",
             local_commit="a" * 40,
             remote_commit="b" * 40,
@@ -368,63 +368,63 @@ class SelfCheckTests(unittest.TestCase):
         text = gu.format_self_check(result)
         self.assertIn("self-update", text)
 
-    @mock.patch("git_updater.save_self_check_cache")
-    @mock.patch("git_updater.parse_rev", return_value="b" * 40)
-    @mock.patch("git_updater.remote_ahead_behind", return_value=(0, 3))
-    @mock.patch("git_updater.pick_self_ff_ref", return_value=("origin/main", "behind"))
-    @mock.patch("git_updater.self_remote_names", return_value=["origin"])
-    @mock.patch("git_updater.fetch_all_remotes")
-    @mock.patch("git_updater.current_commit", return_value="a" * 40)
-    @mock.patch("git_updater.current_branch", return_value="main")
-    @mock.patch("git_updater.is_dirty", return_value=False)
-    @mock.patch("git_updater.install_root")
+    @mock.patch("vend.save_self_check_cache")
+    @mock.patch("vend.parse_rev", return_value="b" * 40)
+    @mock.patch("vend.remote_ahead_behind", return_value=(0, 3))
+    @mock.patch("vend.pick_self_ff_ref", return_value=("origin/main", "behind"))
+    @mock.patch("vend.self_remote_names", return_value=["origin"])
+    @mock.patch("vend.fetch_all_remotes")
+    @mock.patch("vend.current_commit", return_value="a" * 40)
+    @mock.patch("vend.current_branch", return_value="main")
+    @mock.patch("vend.is_dirty", return_value=False)
+    @mock.patch("vend.install_root")
     def test_check_self_git_behind(
         self,
         mock_root: mock.Mock,
         *_m: mock.Mock,
     ) -> None:
-        root = Path("/tmp/git-updater")
+        root = Path("/tmp/vend")
         mock_root.return_value = root
         with mock.patch.object(Path, "exists", return_value=True):
             with mock.patch(
-                "git_updater.read_origin", return_value=("acme/git-updater", "url")
+                "vend.read_origin", return_value=("acme/vend", "url")
             ):
-                with mock.patch("git_updater.load_self_check_cache", return_value=None):
+                with mock.patch("vend.load_self_check_cache", return_value=None):
                     result = gu.check_self(fetch=True, use_cache=False)
         self.assertEqual(result.status, "behind")
         self.assertEqual(result.behind, 3)
         self.assertEqual(result.sync_ref, "origin/main")
 
-    @mock.patch.dict(os.environ, {"GIT_UPDATER_SKIP_SELF_CHECK": "1"})
-    @mock.patch("git_updater.check_self")
+    @mock.patch.dict(os.environ, {"VEND_SKIP_SELF_CHECK": "1"})
+    @mock.patch("vend.check_self")
     def test_maybe_warn_respects_skip_env(self, mock_check: mock.Mock) -> None:
         gu.maybe_warn_self_update()
         mock_check.assert_not_called()
 
     def test_self_remote_names_includes_org_mirror(self) -> None:
         with mock.patch(
-            "git_updater.list_remotes",
+            "vend.list_remotes",
             return_value=[
                 (
                     "origin",
-                    "https://github.com/Klix927/git-updater.git",
-                    "Klix927/git-updater",
+                    "https://github.com/Klix927/vend.git",
+                    "Klix927/vend",
                 ),
                 (
                     "lolaplex",
-                    "https://github.com/Lolaplex/git-updater.git",
-                    "Lolaplex/git-updater",
+                    "https://github.com/Lolaplex/vend.git",
+                    "Lolaplex/vend",
                 ),
             ],
         ):
             with mock.patch(
-                "git_updater.read_origin",
+                "vend.read_origin",
                 return_value=(
-                    "Klix927/git-updater",
-                    "https://github.com/Klix927/git-updater.git",
+                    "Klix927/vend",
+                    "https://github.com/Klix927/vend.git",
                 ),
             ):
-                names = gu.self_remote_names(Path("/tmp/git-updater"))
+                names = gu.self_remote_names(Path("/tmp/vend"))
         self.assertEqual(names, ["origin", "lolaplex"])
 
     def test_remote_from_sync_ref(self) -> None:
@@ -433,18 +433,18 @@ class SelfCheckTests(unittest.TestCase):
             gu.remote_from_sync_ref("origin/feat/x", "feat/x"), "origin"
         )
 
-    @mock.patch("git_updater.check_self")
-    @mock.patch("git_updater.run_update_hook")
+    @mock.patch("vend.check_self")
+    @mock.patch("vend.run_update_hook")
     @mock.patch(
-        "git_updater.resolve_hook_command",
+        "vend.resolve_hook_command",
         return_value=("python -m pip install -e .", "manifest"),
     )
-    @mock.patch("git_updater.catalog_self_entry", return_value=None)
-    @mock.patch("git_updater.self_hook_entry")
-    @mock.patch("git_updater.current_commit", return_value="b" * 40)
-    @mock.patch("git_updater.run_git")
-    @mock.patch("git_updater.is_dirty", return_value=False)
-    @mock.patch("git_updater.install_root")
+    @mock.patch("vend.catalog_self_entry", return_value=None)
+    @mock.patch("vend.self_hook_entry")
+    @mock.patch("vend.current_commit", return_value="b" * 40)
+    @mock.patch("vend.run_git")
+    @mock.patch("vend.is_dirty", return_value=False)
+    @mock.patch("vend.install_root")
     def test_apply_self_update_ff_and_hook(
         self,
         mock_root: mock.Mock,
@@ -457,19 +457,19 @@ class SelfCheckTests(unittest.TestCase):
         mock_hook: mock.Mock,
         mock_check: mock.Mock,
     ) -> None:
-        root = Path("/tmp/git-updater")
+        root = Path("/tmp/vend")
         mock_root.return_value = root
         mock_entry.return_value = gu.RepoEntry(
-            name="git-updater",
-            remote="acme/git-updater",
-            url="https://github.com/acme/git-updater.git",
+            name="vend",
+            remote="acme/vend",
+            url="https://github.com/acme/vend.git",
             path=str(root),
             branch="main",
             commit="a" * 40,
         )
         behind = gu.SelfCheckResult(
             install_path=root,
-            remote="acme/git-updater",
+            remote="acme/vend",
             branch="main",
             local_commit="a" * 40,
             remote_commit="b" * 40,
@@ -479,7 +479,7 @@ class SelfCheckTests(unittest.TestCase):
         )
         done = gu.SelfCheckResult(
             install_path=root,
-            remote="acme/git-updater",
+            remote="acme/vend",
             branch="main",
             local_commit="b" * 40,
             remote_commit="b" * 40,
@@ -492,15 +492,15 @@ class SelfCheckTests(unittest.TestCase):
         mock_hook.assert_called_once()
         self.assertEqual(result.status, "up-to-date")
 
-    @mock.patch.dict(os.environ, {"GIT_UPDATER_SKIP_SELF_CHECK": "1"})
-    @mock.patch("git_updater.apply_self_update")
+    @mock.patch.dict(os.environ, {"VEND_SKIP_SELF_CHECK": "1"})
+    @mock.patch("vend.apply_self_update")
     def test_maybe_apply_respects_skip_env(self, mock_apply: mock.Mock) -> None:
         gu.maybe_apply_self_update()
         mock_apply.assert_not_called()
 
-    @mock.patch("git_updater.apply_self_update")
-    @mock.patch("git_updater.check_self")
-    @mock.patch("git_updater.maybe_warn_self_update")
+    @mock.patch("vend.apply_self_update")
+    @mock.patch("vend.check_self")
+    @mock.patch("vend.maybe_warn_self_update")
     def test_maybe_apply_skips_patch_when_cache_fresh(
         self,
         mock_warn: mock.Mock,
@@ -508,22 +508,22 @@ class SelfCheckTests(unittest.TestCase):
         mock_apply: mock.Mock,
     ) -> None:
         recent = {"checked_at": datetime.now(timezone.utc).isoformat()}
-        with mock.patch("git_updater.load_self_check_cache", return_value=recent):
+        with mock.patch("vend.load_self_check_cache", return_value=recent):
             gu.maybe_apply_self_update()
         mock_apply.assert_not_called()
         mock_check.assert_not_called()
         mock_warn.assert_called_once()
 
-    @mock.patch("git_updater.apply_self_update")
-    @mock.patch("git_updater.check_self")
+    @mock.patch("vend.apply_self_update")
+    @mock.patch("vend.check_self")
     def test_maybe_apply_patches_when_cache_stale_and_behind(
         self,
         mock_check: mock.Mock,
         mock_apply: mock.Mock,
     ) -> None:
         behind = gu.SelfCheckResult(
-            install_path=Path("/tmp/git-updater"),
-            remote="acme/git-updater",
+            install_path=Path("/tmp/vend"),
+            remote="acme/vend",
             branch="main",
             local_commit="a" * 40,
             remote_commit="b" * 40,
@@ -531,7 +531,7 @@ class SelfCheckTests(unittest.TestCase):
             sync_ref="origin/main",
         )
         mock_check.return_value = behind
-        with mock.patch("git_updater.load_self_check_cache", return_value=None):
+        with mock.patch("vend.load_self_check_cache", return_value=None):
             gu.maybe_apply_self_update()
         mock_check.assert_called_once_with(fetch=True, use_cache=False)
         mock_apply.assert_called_once_with(interactive=False, observed=behind)
@@ -593,7 +593,7 @@ class SyncRefTests(unittest.TestCase):
                 return (0, 1)
             return (0, 0)
 
-        with mock.patch("git_updater.remote_ahead_behind", side_effect=fake_ahead):
+        with mock.patch("vend.remote_ahead_behind", side_effect=fake_ahead):
             ref, kind = gu.pick_sync_ref(Path("/tmp/r"), "main", ["origin", "lolaplex"])
         self.assertEqual(kind, "current")
         self.assertIsNone(ref)
@@ -604,13 +604,13 @@ class SyncRefTests(unittest.TestCase):
                 return (1, 1)
             return (0, 3)
 
-        with mock.patch("git_updater.remote_ahead_behind", side_effect=fake_ahead):
+        with mock.patch("vend.remote_ahead_behind", side_effect=fake_ahead):
             ref, kind = gu.pick_sync_ref(Path("/tmp/r"), "main", ["origin", "lolaplex"])
         self.assertEqual(kind, "diverged")
         self.assertIsNone(ref)
 
     def test_origin_behind_ffs_origin(self) -> None:
-        with mock.patch("git_updater.remote_ahead_behind", return_value=(0, 2)):
+        with mock.patch("vend.remote_ahead_behind", return_value=(0, 2)):
             ref, kind = gu.pick_sync_ref(Path("/tmp/r"), "main", ["origin", "lolaplex"])
         self.assertEqual(kind, "behind")
         self.assertEqual(ref, "origin/main")
@@ -625,8 +625,8 @@ class SelfFfRefTests(unittest.TestCase):
                 return (0, 1)
             return (0, 0)
 
-        with mock.patch("git_updater.remote_ahead_behind", side_effect=fake_ahead):
-            with mock.patch("git_updater.is_ancestor", return_value=True):
+        with mock.patch("vend.remote_ahead_behind", side_effect=fake_ahead):
+            with mock.patch("vend.is_ancestor", return_value=True):
                 ref, kind = gu.pick_self_ff_ref(
                     Path("/tmp/r"), "main", ["origin", "lolaplex"]
                 )
@@ -639,8 +639,8 @@ class SelfFfRefTests(unittest.TestCase):
                 return (0, 0)
             return (0, 2)
 
-        with mock.patch("git_updater.remote_ahead_behind", side_effect=fake_ahead):
-            with mock.patch("git_updater.is_ancestor", return_value=False):
+        with mock.patch("vend.remote_ahead_behind", side_effect=fake_ahead):
+            with mock.patch("vend.is_ancestor", return_value=False):
                 ref, kind = gu.pick_self_ff_ref(
                     Path("/tmp/r"), "main", ["origin", "other"]
                 )
@@ -653,7 +653,7 @@ class SelfFfRefTests(unittest.TestCase):
                 return (1, 1)
             return (0, 3)
 
-        with mock.patch("git_updater.remote_ahead_behind", side_effect=fake_ahead):
+        with mock.patch("vend.remote_ahead_behind", side_effect=fake_ahead):
             ref, kind = gu.pick_self_ff_ref(
                 Path("/tmp/r"), "main", ["origin", "lolaplex"]
             )
@@ -667,8 +667,8 @@ class MirrorShaTests(unittest.TestCase):
             ("origin", "https://github.com/me/app.git", "me/app"),
             ("lolaplex", "https://github.com/Lolaplex/app.git", "lolaplex/app"),
         ]
-        with mock.patch("git_updater.list_remotes", return_value=remotes):
-            with mock.patch("git_updater.remotes_containing_commit", return_value={"origin"}):
+        with mock.patch("vend.list_remotes", return_value=remotes):
+            with mock.patch("vend.remotes_containing_commit", return_value={"origin"}):
                 mirrors = gu.mirrors_from_clone(
                     Path("/tmp/app"),
                     "https://github.com/me/app.git",
@@ -681,9 +681,9 @@ class MirrorShaTests(unittest.TestCase):
             ("origin", "https://github.com/me/app.git", "me/app"),
             ("lolaplex", "https://github.com/Lolaplex/app.git", "lolaplex/app"),
         ]
-        with mock.patch("git_updater.list_remotes", return_value=remotes):
+        with mock.patch("vend.list_remotes", return_value=remotes):
             with mock.patch(
-                "git_updater.remotes_containing_commit",
+                "vend.remotes_containing_commit",
                 return_value={"origin", "lolaplex"},
             ):
                 mirrors = gu.mirrors_from_clone(
@@ -695,9 +695,9 @@ class MirrorShaTests(unittest.TestCase):
 
 
 class CheckoutPinTests(unittest.TestCase):
-    @mock.patch("git_updater.run_git")
-    @mock.patch("git_updater.fetch_commit")
-    @mock.patch("git_updater.commit_exists", side_effect=[False, True])
+    @mock.patch("vend.run_git")
+    @mock.patch("vend.fetch_commit")
+    @mock.patch("vend.commit_exists", side_effect=[False, True])
     def test_fetches_then_checkouts(
         self,
         _exists: mock.Mock,
@@ -710,8 +710,8 @@ class CheckoutPinTests(unittest.TestCase):
         mock_fetch.assert_called_once_with(dest, "a" * 40, urls)
         mock_run.assert_called_once_with(dest, "checkout", "--detach", "a" * 40)
 
-    @mock.patch("git_updater.fetch_commit")
-    @mock.patch("git_updater.commit_exists", return_value=False)
+    @mock.patch("vend.fetch_commit")
+    @mock.patch("vend.commit_exists", return_value=False)
     def test_errors_when_commit_missing(self, _exists: mock.Mock, mock_fetch: mock.Mock) -> None:
         with self.assertRaises(SystemExit) as raised:
             gu.checkout_pin(Path("/tmp/r"), "deadbeef")
@@ -749,8 +749,8 @@ class HelpSpecTests(unittest.TestCase):
 
     def test_man_page_is_roff(self) -> None:
         man = gu.render_man()
-        self.assertIn(".TH GIT-UPDATER 1", man)
-        self.assertIn("git-updater", man)
+        self.assertIn(".TH VEND 1", man)
+        self.assertIn("vend", man)
         self.assertIn(".B init", man)
         self.assertIn("hook-sync", man)
         self.assertIn("pin --here", man)
@@ -759,8 +759,8 @@ class HelpSpecTests(unittest.TestCase):
 class SkillInstallTests(unittest.TestCase):
     def test_template_has_frontmatter(self) -> None:
         text = gu.skill_template_path().read_text(encoding="utf-8")
-        self.assertIn("name: git-updater", text)
-        self.assertIn("git-updater --help-json", text)
+        self.assertIn("name: vend", text)
+        self.assertIn("vend --help-json", text)
         self.assertIn(gu.SKILL_PATHS_BEGIN, text)
 
     def test_install_user_skills_writes_cursor_and_agents(self) -> None:
@@ -772,10 +772,10 @@ class SkillInstallTests(unittest.TestCase):
             for path in written:
                 self.assertTrue(path.is_file())
                 body = path.read_text(encoding="utf-8")
-                self.assertIn("name: git-updater", body)
+                self.assertIn("name: vend", body)
                 self.assertIn(root, body)
-            cursor = home / ".cursor" / "skills" / "git-updater" / "SKILL.md"
-            agents = home / ".agents" / "skills" / "git-updater" / "SKILL.md"
+            cursor = home / ".cursor" / "skills" / "vend" / "SKILL.md"
+            agents = home / ".agents" / "skills" / "vend" / "SKILL.md"
             self.assertTrue(cursor.is_file())
             self.assertTrue(agents.is_file())
 
@@ -804,7 +804,7 @@ class PinHookTests(unittest.TestCase):
             self.assertIsNone(gu.catalog_entry_for_path(catalog, root / "other"))
 
     def test_pin_hook_script_post_checkout(self) -> None:
-        text = gu.pin_hook_script("post-checkout", "git-updater")
+        text = gu.pin_hook_script("post-checkout", "vend")
         self.assertIn(gu.PIN_HOOK_MARKER, text)
         self.assertIn('if [ "$1" = "$2" ]; then exit 0; fi', text)
         self.assertIn("pin --here --quiet", text)
@@ -833,9 +833,9 @@ class PinHookTests(unittest.TestCase):
             self.assertEqual((hooks / "post-commit").read_text(encoding="utf-8"), "#!/bin/sh\necho custom\n")
             self.assertTrue(installed)
 
-    @mock.patch("git_updater.save_catalog")
-    @mock.patch("git_updater.pin_entry", return_value=True)
-    @mock.patch("git_updater.catalog_entry_for_path")
+    @mock.patch("vend.save_catalog")
+    @mock.patch("vend.pin_entry", return_value=True)
+    @mock.patch("vend.catalog_entry_for_path")
     def test_pin_here_quiet_on_missing(
         self,
         mock_lookup: mock.Mock,
@@ -843,8 +843,8 @@ class PinHookTests(unittest.TestCase):
         _save: mock.Mock,
     ) -> None:
         mock_lookup.return_value = None
-        with mock.patch("git_updater.load_catalog", return_value=gu.Catalog(version=1, root="/tmp", repos=[])):
-            with mock.patch("git_updater.log_hook_pin") as log:
+        with mock.patch("vend.load_catalog", return_value=gu.Catalog(version=1, root="/tmp", repos=[])):
+            with mock.patch("vend.log_hook_pin") as log:
                 gu.cmd_pin(argparse_namespace(here=True, quiet=True, name=None, export=False))
         log.assert_called_once()
         mock_pin.assert_not_called()

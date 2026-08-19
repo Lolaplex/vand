@@ -1,6 +1,6 @@
-# git-updater
+# vend
 
-Track shared git repos on your machine, pin them to exact commits, and export a **shareable `vendor.lock`** so another computer can replicate the whole stack with one command.
+Track shared git repos on your machine, pin them to exact commits, and export a **shareable `vend.lock`** so another computer can replicate the whole stack with one command.
 
 Works with **any git remote** — GitHub, GitLab, Bitbucket, self-hosted, `file://` paths, and local folder clones — not just `github.com`.
 
@@ -14,9 +14,9 @@ Manual CLI only — no background scheduler. For general cron/timer automation, 
 | **[myrepos](https://myrepos.branchable.com/)** (`mr update`) | Update many repos | No exact SHA lockfile for replication |
 | **[hawser](https://github.com/Nastwinns/hawser)** (`haw sync`) | Multi-repo lockfile + verify | Rust stack, heavier scope |
 | **[Repo Family](https://github.com/JohnsonArnek/Github-Family)** | Control repo + lock | No personal catalog curation |
-| **git-updater** | Catalog + `vendor.lock` + `replicate` | Small Python stdlib CLI |
+| **vend** | Catalog + `vend.lock` + `replicate` | Small Python stdlib CLI |
 
-Per-app library pins (a `vendor.lock` *inside* one project) pin trees in that project. git-updater pins **whole repos** across a clone root on your machine.
+Per-app library pins (a `vend.lock` *inside* one project) pin trees in that project. vend pins **whole repos** across a clone root on your machine.
 
 ## Install
 
@@ -24,20 +24,20 @@ Python 3.9+, Git, and pip. From a clone:
 
 ```powershell
 python -m pip install -e .
-git-updater init --root <clone-root>
+vend init --root <clone-root>
 ```
 
 Or from a fresh clone, skip the separate pip — `init` runs `pip install -e` itself:
 
 ```powershell
-python git_updater.py init --root <clone-root>
+python vend.py init --root <clone-root>
 ```
 
-That puts `git-updater` on PATH (Windows: the Python `Scripts` folder). Editable (`-e`) keeps the command pointed at this checkout, so `self-update` / `git pull` still work.
+That puts `vend` on PATH (Windows: the Python `Scripts` folder). Editable (`-e`) keeps the command pointed at this checkout, so `self-update` / `git pull` still work.
 
-Without installing, you can still run `python git_updater.py` or `git-updater.cmd` from this directory.
+Without installing, you can still run `python vend.py` or `vend.cmd` from this directory.
 
-**Coding agents:** follow [`AGENTS.md`](AGENTS.md). That file is the install spec. This README is the map. First-run is `python git_updater.py init --root <clone-root>` (catalog, pip -e, skills, adopt self, shared.lock). Usage skill: [`skills/git-updater/SKILL.md`](skills/git-updater/SKILL.md).
+**Coding agents:** follow [`AGENTS.md`](AGENTS.md). That file is the install spec. This README is the map. First-run is `python vend.py init --root <clone-root>` (catalog, pip -e, skills, adopt self, shared.lock). Usage skill: [`skills/vend/SKILL.md`](skills/vend/SKILL.md).
 
 ## Help that machines can read
 
@@ -46,71 +46,71 @@ Human `--help` is a wall of text. Agents and other tools should not scrape it.
 **All machine-readable help is generated from argparse at runtime** — there is no committed man page or JSON spec in the repo. If you add a flag or command, `--help-json` and `man` update automatically.
 
 ```powershell
-git-updater --help              # people
-git-updater --help-json         # full spec: commands, flags, args, defaults
-git-updater --help-json replicate
-git-updater help --json
-git-updater help replicate --json
-git-updater man                 # roff on stdout (generated; same source as --help-json)
-git-updater man --write FILE    # optional local copy, e.g. man/git-updater.1 for groff
+vend --help              # people
+vend --help-json         # full spec: commands, flags, args, defaults
+vend --help-json replicate
+vend help --json
+vend help replicate --json
+vend man                 # roff on stdout (generated; same source as --help-json)
+vend man --write FILE    # optional local copy, e.g. man/vend.1 for groff
 ```
 
-On Unix: `git-updater man | groff -man -Tutf8 | less`. Optional: `git-updater man --write man/git-updater.1` then `MANPATH=man man git-updater`.
+On Unix: `vend man | groff -man -Tutf8 | less`. Optional: `vend man --write man/vend.1` then `MANPATH=man man vend`.
 
-Do **not** commit `man/` or in-repo `.cursor/` skill copies — both are gitignored local output. Source of truth: `git_updater.py` (argparse) and `skills/git-updater/SKILL.md`.
+Do **not** commit `man/` or in-repo `.cursor/` skill copies — both are gitignored local output. Source of truth: `vend.py` (argparse) and `skills/vend/SKILL.md`.
 
 ## Quick start
 
 ```powershell
 # 1. First-run (catalog + PATH + skills + adopt this clone + shared.lock)
-git-updater init --root <clone-root>
+vend init --root <clone-root>
 
 # 2. See existing clones not yet tracked
-git-updater scan
+vend scan
 
-# 3. Register an existing folder (reads .git-updater.yaml if present)
-git-updater adopt <folder>
-git-updater adopt <folder> --install "make install"  # optional override
+# 3. Register an existing folder (reads vend.yml if present)
+vend adopt <folder>
+vend adopt <folder> --install "make install"  # optional override
 
 # 4. Check state
-git-updater status
-git-updater status --fetch
+vend status
+vend status --fetch
 
 # 5. Export shareable lock + human vendor log
-git-updater export
-# -> <clone-root>/vendor.lock
-# -> <clone-root>/VENDOR.md
+vend export
+# -> <clone-root>/vend.lock
+# -> <clone-root>/VEND.md
 ```
 
-`<clone-root>` is whatever directory you keep checkouts in. Catalog state lives in `~/.git-updater/` on **this** machine only.
+`<clone-root>` is whatever directory you keep checkouts in. Catalog state lives in `~/.vend/` on **this** machine only.
 
 ## Shared stack (Lolaplex)
 
-This repo publishes a starter lock for the tools we share. It does **not** pin git-updater itself (the lock lives in this repo).
+This repo publishes a starter lock for the tools we share. It does **not** pin vend itself (the lock lives in this repo).
 
 ```powershell
 cd <clone-root>
-git clone https://github.com/Lolaplex/git-updater.git
-python git-updater/git_updater.py init --root .
+git clone https://github.com/Lolaplex/vend.git
+python vend/vend.py init --root .
 ```
 
-`init` creates the catalog, `pip install -e` this clone, installs the agent skill, adopts git-updater, replicates `examples/shared.lock`, and adopts those repos. If you run `init` inside the git-updater folder with default `--root .`, the clone root becomes the parent.
+`init` creates the catalog, `pip install -e` this clone, installs the agent skill, adopts vend, replicates `examples/shared.lock`, and adopts those repos. If you run `init` inside the vend folder with default `--root .`, the clone root becomes the parent.
 
 Daily sync (pull when the other person pushed):
 
 ```powershell
-git-updater update agent-memory
-git-updater push agent-memory   # after your own commits
+vend update agent-memory
+vend push agent-memory   # after your own commits
 ```
 
 `update` fast-forwards a clean tree and re-runs install hooks when the commit changes. Dirty or diverged trees are left alone — `consolidate` if you both edited.
 
 ## On another machine
 
-Copy `vendor.lock` (and optionally `VENDOR.md`), then:
+Copy `vend.lock` (and optionally `VEND.md`), then:
 
 ```powershell
-git-updater replicate vendor.lock --root <clone-root>
+vend replicate vend.lock --root <clone-root>
 ```
 
 If you omit `--root`, clones land next to the lockfile. Absolute `root` values from another computer are ignored.
@@ -120,34 +120,34 @@ Clones missing repos, checks out exact SHAs, runs each repo's `install` hook.
 Dry run first:
 
 ```powershell
-git-updater replicate vendor.lock --root <clone-root> --dry-run
+vend replicate vend.lock --root <clone-root> --dry-run
 ```
 
 ## Daily workflow
 
 ```powershell
-git-updater update          # fetch + fast-forward clean repos; re-run install on commit change
-git-updater consolidate     # fetch + merge when ff-only fails; lists conflicts to fix
-git-updater consolidate --continue NAME   # after fixing conflict markers
-git-updater consolidate --abort NAME      # abort stuck merge/rebase
-git-updater push            # push tracking branches; re-pin HEAD
-git-updater pin             # pin catalog to current HEAD after local commits
-git-updater pin --export    # pin + write vendor.lock
-git-updater hook-sync       # once: install git hooks so plain git keeps catalog pinned
-git-updater verify          # exit 1 if any clone != lock (CI gate)
+vend update          # fetch + fast-forward clean repos; re-run install on commit change
+vend consolidate     # fetch + merge when ff-only fails; lists conflicts to fix
+vend consolidate --continue NAME   # after fixing conflict markers
+vend consolidate --abort NAME      # abort stuck merge/rebase
+vend push            # push tracking branches; re-pin HEAD
+vend pin             # pin catalog to current HEAD after local commits
+vend pin --export    # pin + write vend.lock
+vend hook-sync       # once: install git hooks so plain git keeps catalog pinned
+vend verify          # exit 1 if any clone != lock (CI gate)
 ```
 
 Dirty or diverged repos are **never** force-reset. Use `consolidate` when `update` stops at diverged/ff-only failures, then `pin`.
 
 ## Lock-step with plain `git pull` / `git push`
 
-`update`, `push`, `pin`, and `consolidate` write HEAD into `~/.git-updater/catalog.json`. Your Agent, GitHub Desktop, and raw `git` do not.
+`update`, `push`, `pin`, and `consolidate` write HEAD into `~/.vend/catalog.json`. Your Agent, GitHub Desktop, and raw `git` do not.
 
-### Two different “hooks”
+### Two different "hooks"
 
 | Command | What it syncs | Where |
 |---------|----------------|-------|
-| **`sync-hooks`** | **Manifest** install/update shell commands from each repo's `.git-updater.yaml` into the catalog | `catalog.json` fields |
+| **`sync-hooks`** | **Manifest** install/update shell commands from each repo's `vend.yml` into the catalog | `catalog.json` fields |
 | **`hook-sync`** | **Git** hooks that re-pin the catalog after commit / pull / rebase / checkout | `<clone>/.git/hooks/` |
 
 Do not confuse them. `sync-hooks` does not install pin hooks. `hook-sync` does not read manifests.
@@ -155,13 +155,13 @@ Do not confuse them. `sync-hooks` does not install pin hooks. `hook-sync` does n
 ### Pin hooks (`hook-sync`)
 
 ```powershell
-git-updater hook-sync                 # all catalog repos
-git-updater hook-sync agent-memory    # one repo
-git-updater pin --here                # pin the catalog row for cwd (manual test)
-git-updater pin --here --quiet        # same, used inside git hooks
+vend hook-sync                 # all catalog repos
+vend hook-sync agent-memory    # one repo
+vend pin --here                # pin the catalog row for cwd (manual test)
+vend pin --here --quiet        # same, used inside git hooks
 ```
 
-`adopt` and `add` run `hook-sync` on the new clone. **Existing catalog entries:** run `hook-sync` once after upgrading git-updater.
+`adopt` and `add` run `hook-sync` on the new clone. **Existing catalog entries:** run `hook-sync` once after upgrading vend.
 
 | Git hook | When it runs |
 |----------|----------------|
@@ -170,15 +170,15 @@ git-updater pin --here --quiet        # same, used inside git hooks
 | `post-rewrite` | Rebase / amend |
 | `post-checkout` | Branch switch, only when HEAD actually changed |
 
-Each hook runs `git-updater pin --here --quiet`. That looks up the catalog row by this clone's path and sets `commit` (and branch) to HEAD. Failures append to `~/.git-updater/logs/hook-pin.log` and **never** fail the git command (`|| true`).
+Each hook runs `vend pin --here --quiet`. That looks up the catalog row by this clone's path and sets `commit` (and branch) to HEAD. Failures append to `~/.vend/logs/hook-pin.log` and **never** fail the git command (`|| true`).
 
-**Prerequisites:** clone must be in the catalog (`adopt` / `add` / `init`). `git-updater` must be on PATH (or the hook falls back to `py -3` / `python` + this checkout's `git_updater.py`).
+**Prerequisites:** clone must be in the catalog (`adopt` / `add` / `init`). `vend` must be on PATH (or the hook falls back to `py -3` / `python` + this checkout's `vend.py`).
 
 `git push` does not move HEAD. Commit/pull already pinned the SHA; `status --fetch` is enough to see whether origin is caught up.
 
-Do not set global `core.hooksPath` (Git replaces per-repo hooks instead of chaining). Do not alias `git`. Do not auto-export `vendor.lock` from hooks (`pin --export` / `export` stay explicit). Foreign hook files are left alone unless `--force` (appends the pin block after the existing script).
+Do not set global `core.hooksPath` (Git replaces per-repo hooks instead of chaining). Do not alias `git`. Do not auto-export `vend.lock` from hooks (`pin --export` / `export` stay explicit). Foreign hook files are left alone unless `--force` (appends the pin block after the existing script).
 
-`desktop-commander` is the later scheduler clock (`git-updater update` at 09:00). Pin hooks are the residual patch for ad-hoc git in the working tree.
+`desktop-commander` is the later scheduler clock (`vend update` at 09:00). Pin hooks are the residual patch for ad-hoc git in the working tree.
 
 ## Remote URLs
 
@@ -188,23 +188,23 @@ Do not set global `core.hooksPath` (Git replaces per-repo hooks instead of chain
 | HTTPS / SSH | `https://gitlab.com/group/project.git`, `git@host:org/repo.git` |
 | Local path | a folder on disk, or `file://` URL |
 
-`adopt` reads `origin` (push target). Extra remotes are stored as `mirrors` only if they **already contain the pinned SHA**. `vendor.lock` stores `remote` (id), `url` (clone source), and optional `mirrors` (other fetch URLs for that same commit). Older locks with only `github` still load.
+`adopt` reads `origin` (push target). Extra remotes are stored as `mirrors` only if they **already contain the pinned SHA**. `vend.lock` stores `remote` (id), `url` (clone source), and optional `mirrors` (other fetch URLs for that same commit). Older locks with only `github` still load.
 
 **Pins are SHAs.** `Klix927/agent-memory` and `Lolaplex/agent-memory` are different remotes. They are fetch sources for a pin only when that exact commit exists there. `replicate` / `install` fetch `url` plus listed `mirrors` until the lock SHA is present, then check out that SHA. `update` / `push` still follow **origin**. A GitHub repo *name* match is not identity.
 
-## For repo authors — `.git-updater.yaml`
+## For repo authors — `vend.yml`
 
 Stop writing install guides only in README. Add a **machine-readable manifest** at the repo root:
 
 ```yaml
-# .git-updater.yaml
+# vend.yml
 version: 1
 install: npm ci && npm run build
 update: npm ci
 verify: npm test
 ```
 
-Also supported: `git-updater.json`, `.git-updater.json`, `.git-updater.yml`.
+Also supported: `vend.yaml`, `vend.json`.
 
 | Key | When it runs |
 |-----|----------------|
@@ -214,27 +214,27 @@ Also supported: `git-updater.json`, `.git-updater.json`, `.git-updater.yml`.
 
 Commands can be a string, a list (run in sequence with `&&`), or `{ run: scripts/setup.sh, shell: bash }`.
 
-If no manifest exists, git-updater tries conservative heuristics (`Makefile` `install`, `package.json`, `requirements.txt`, `composer.json`, `go.mod`, `uv.lock`).
+If no manifest exists, vend tries conservative heuristics (`Makefile` `install`, `package.json`, `requirements.txt`, `composer.json`, `go.mod`, `uv.lock`).
 
 ```powershell
-git-updater scan          # shows [manifest file] next to repos that declare hooks
-git-updater sync-hooks    # refresh catalog from on-disk manifests
+vend scan          # shows [manifest file] next to repos that declare hooks
+vend sync-hooks    # refresh catalog from on-disk manifests
 ```
 
-The manifest is **in the repo** — it travels with the code, gets pinned in `vendor.lock`, and works on every machine after `replicate`. No Nix required.
+The manifest is **in the repo** — it travels with the code, gets pinned in `vend.lock`, and works on every machine after `replicate`. No Nix required.
 
-See [`git-updater.schema.json`](git-updater.schema.json) for the JSON shape.
+See [`vend.schema.json`](vend.schema.json) for the JSON shape.
 
 ## Where files live
 
 | File | Purpose |
 |------|---------|
-| `~/.git-updater/catalog.json` | Your curated repo list (private to this machine, includes local clone root) |
-| `~/.git-updater/logs/` | Timestamped logs from update/install/replicate |
-| `~/.git-updater/logs/hook-pin.log` | Quiet pin failures from git hooks |
+| `~/.vend/catalog.json` | Your curated repo list (private to this machine, includes local clone root) |
+| `~/.vend/logs/` | Timestamped logs from update/install/replicate |
+| `~/.vend/logs/hook-pin.log` | Quiet pin failures from git hooks |
 | `<clone>/.git/hooks/` | Pin hooks installed by `hook-sync` (not in the clone's tree) |
-| `<clone-root>/vendor.lock` | Shareable pin snapshot (relative paths only; no machine root) |
-| `<clone-root>/VENDOR.md` | Human-readable vendor table |
+| `<clone-root>/vend.lock` | Shareable pin snapshot (relative paths only; no machine root) |
+| `<clone-root>/VEND.md` | Human-readable vendor table |
 
 ## Commands
 
@@ -256,10 +256,10 @@ See [`git-updater.schema.json`](git-updater.schema.json) for the JSON shape.
 | `pin --here [--quiet]` | Pin catalog row for cwd; `--quiet` for git hooks (logs on failure) |
 | `hook-sync [NAME] [--force]` | Install **git** pin hooks in `.git/hooks/` |
 | `install [NAME]` | Clone missing + checkout pin + install hooks |
-| `export [--out PATH]` | Write vendor.lock + VENDOR.md |
+| `export [--out PATH]` | Write vend.lock + VEND.md |
 | `replicate LOCK [--root PATH] [--dry-run]` | Bootstrap from lock |
 | `verify [--lock PATH]` | Drift check |
-| `self-check [--fetch] [--json]` | Check if git-updater itself is up to date |
+| `self-check [--fetch] [--json]` | Check if vend itself is up to date |
 | `self-update` | Fast-forward this checkout (only refs that are descendants of HEAD) + reinstall |
 | `install-skills` | Copy agent skill to `~/.cursor/skills` and `~/.agents/skills` |
 | `help [CMD] [--json]` | Human or JSON help (JSON generated from argparse) |
@@ -267,7 +267,7 @@ See [`git-updater.schema.json`](git-updater.schema.json) for the JSON shape.
 
 Global: `--no-self-check` skips the 24h residual self-update. `--help-json` prints the CLI spec and exits.
 
-## vendor.lock format (v1)
+## vend.lock format (v1)
 
 Portable. No absolute paths. `path` is relative to the clone root you pass to `replicate`.
 
@@ -293,14 +293,14 @@ Portable. No absolute paths. `path` is relative to the clone root you pass to `r
 
 ## Automation (future)
 
-Scheduled `git-updater update` belongs in a **separate desktop scheduler** project (general cron/timer for any command). git-updater v1 is intentionally manual with visible terminal output and logs under `~/.git-updater/logs/`.
+Scheduled `vend update` belongs in a **separate desktop scheduler** project (general cron/timer for any command). vend v1 is intentionally manual with visible terminal output and logs under `~/.vend/logs/`.
 
 Example future job:
 
 ```yaml
 - name: sync-repos
-  command: git-updater update && git-updater export
-  cwd: /path/to/git-updater
+  command: vend update && vend export
+  cwd: /path/to/vend
   schedule: "0 9 * * *"
 ```
 
@@ -312,19 +312,19 @@ python -m unittest discover -s tests -v
 
 ## Self-update
 
-git-updater keeps **itself** current from this checkout's remotes (personal `origin` + org mirror both count, same as other repos):
+vend keeps **itself** current from this checkout's remotes (personal `origin` + org mirror both count, same as other repos):
 
 ```powershell
-git-updater self-check              # uses 24h cache when offline-friendly
-git-updater self-check --fetch        # force fresh compare
-git-updater self-update               # ff-only + `python -m pip install -e .`
+vend self-check              # uses 24h cache when offline-friendly
+vend self-check --fetch        # force fresh compare
+vend self-update               # ff-only + `python -m pip install -e .`
 ```
 
-After other commands, git-updater **observes** remotes at most once per 24h. If that observe shows a clean fast-forward residual, it patches (ff-only + reinstall). Within the TTL it only prints a hint from cache. Dirty or diverged trees are left alone. Disable with `--no-self-check` or `GIT_UPDATER_SKIP_SELF_CHECK=1`. `self-update` always observes and patches.
+After other commands, vend **observes** remotes at most once per 24h. If that observe shows a clean fast-forward residual, it patches (ff-only + reinstall). Within the TTL it only prints a hint from cache. Dirty or diverged trees are left alone. Disable with `--no-self-check` or `VEND_SKIP_SELF_CHECK=1`. `self-update` always observes and patches.
 
 Detection order:
 
-1. If `git_updater.py` lives in a git clone: compare `HEAD` to configured remotes. Catalog `update` follows origin. `self-update` fast-forwards a remote tip only when `HEAD` is an ancestor of that tip.
+1. If `vend.py` lives in a git clone: compare `HEAD` to configured remotes. Catalog `update` follows origin. `self-update` fast-forwards a remote tip only when `HEAD` is an ancestor of that tip.
 2. Else if `origin` is a GitHub `owner/repo` URL: GitHub API
 3. Otherwise: unknown (no hardcoded upstream)
 

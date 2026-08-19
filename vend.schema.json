@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "git-updater repo manifest",
+  "title": "vend source descriptor",
   "type": "object",
   "properties": {
     "version": { "type": "integer", "const": 1 },

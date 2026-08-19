@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Git vendor tracker — catalog, vendor.lock, replicate."""
+"""vend — catalog, pin, and replicate source instances."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from urllib.request import Request, urlopen
 
 CATALOG_VERSION = 1
 LOCK_VERSION = 1
-CONFIG_DIR = Path.home() / ".git-updater"
+CONFIG_DIR = Path.home() / ".vend"
 CATALOG_PATH = CONFIG_DIR / "catalog.json"
 LOG_DIR = CONFIG_DIR / "logs"
 SELF_CHECK_CACHE = CONFIG_DIR / "self-check.json"
@@ -28,19 +28,19 @@ SELF_CHECK_TTL_SECS = 24 * 60 * 60
 SKIP_SELF_CHECK_COMMANDS = frozenset(
     {"self-check", "self-update", "init", "help", "man", "install-skills", "pin", "hook-sync"}
 )
-SKILL_NAME = "git-updater"
-SKILL_PATHS_BEGIN = "<!-- git-updater-paths -->"
-SKILL_PATHS_END = "<!-- /git-updater-paths -->"
-PIN_HOOK_MARKER = "git-updater-managed: pin --here"
+SKILL_NAME = "vend"
+SKILL_PATHS_BEGIN = "<!-- vend-paths -->"
+SKILL_PATHS_END = "<!-- /vend-paths -->"
+PIN_HOOK_MARKER = "vend-managed: pin --here"
 PIN_HOOK_NAMES = ("post-commit", "post-merge", "post-rewrite", "post-checkout")
 
 MANIFEST_FILENAMES = (
-    ".git-updater.json",
-    "git-updater.json",
-    ".git-updater.yaml",
-    "git-updater.yaml",
-    ".git-updater.yml",
-    "git-updater.yml",
+    "vend.json",
+    "vend.yaml",
+    "vend.yml",
+    ".vend.json",
+    ".vend.yaml",
+    ".vend.yml",
 )
 
 GITHUB_RE = re.compile(
@@ -147,7 +147,7 @@ def ensure_config_dir() -> None:
 def load_catalog() -> Catalog:
     if not CATALOG_PATH.exists():
         raise SystemExit(
-            f"No catalog at {CATALOG_PATH}. Run: git-updater init --root <path>"
+            f"No catalog at {CATALOG_PATH}. Run: vend init --root <path>"
         )
     data = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
     return Catalog.from_dict(data)
@@ -194,9 +194,9 @@ def machine_skill_text(root: Path | None = None) -> str:
     root_s = normalize_path(root)
     block = (
         f"Install (engine): `{root_s}`\n"
-        "Invoke (PATH): `git-updater` after `python -m pip install -e .` from that clone.\n"
-        f"Fallback: `python {root_s}/git_updater.py`\n"
-        "Machine-readable spec: `git-updater --help-json` (or `git-updater --help-json COMMAND`).\n"
+        "Invoke (PATH): `vend` after `python -m pip install -e .` from that clone.\n"
+        f"Fallback: `python {root_s}/vend.py`\n"
+        "Machine-readable spec: `vend --help-json` (or `vend --help-json COMMAND`).\n"
     )
     if SKILL_PATHS_BEGIN in template and SKILL_PATHS_END in template:
         pre, rest = template.split(SKILL_PATHS_BEGIN, 1)
@@ -228,16 +228,16 @@ def pip_editable_self() -> None:
         check=False,
     )
     if result.returncode != 0:
-        raise SystemExit("pip install -e failed; git-updater is not on PATH")
+        raise SystemExit("pip install -e failed; vend is not on PATH")
 
 
 def infer_clone_root(root_arg: str) -> Path:
-    """If --root is this checkout, use the parent so stacks land next to git-updater."""
+    """If --root is this checkout, use the parent so stacks land next to vend."""
     requested = Path(root_arg).expanduser().resolve()
     self_root = install_root()
     if requested == self_root:
         parent = self_root.parent
-        print(f"This checkout is git-updater; clone root -> {parent}")
+        print(f"This checkout is vend; clone root -> {parent}")
         return parent
     return requested
 
@@ -274,7 +274,7 @@ def github_api_json(url: str) -> dict[str, Any] | None:
         url,
         headers={
             "Accept": "application/vnd.github+json",
-            "User-Agent": "git-updater",
+            "User-Agent": "vend",
         },
     )
     try:
@@ -492,13 +492,13 @@ def format_self_check(result: SelfCheckResult, verbose: bool = True) -> str:
     remote = result.remote_commit[:7] if result.remote_commit else "n/a"
     upstream = remote_display_url(result.remote)
     lines = [
-        f"git-updater install: {normalize_path(result.install_path)}",
+        f"vend install: {normalize_path(result.install_path)}",
         f"upstream: {upstream}" + (f" ({result.branch})" if result.branch else ""),
         f"local:  {local}   remote: {remote}   status: {result.status}",
     ]
     if result.status == "behind":
         detail = f"{result.behind} commit(s) behind" if result.behind else "update available"
-        lines.append(f"-> {detail}. Run: git-updater self-update")
+        lines.append(f"-> {detail}. Run: vend self-update")
     elif result.status == "dirty":
         lines.append("-> local changes present - commit or stash before self-update")
     elif result.status == "diverged":
@@ -517,15 +517,15 @@ def format_self_check(result: SelfCheckResult, verbose: bool = True) -> str:
 
 
 def maybe_warn_self_update() -> None:
-    if os.environ.get("GIT_UPDATER_SKIP_SELF_CHECK") == "1":
+    if os.environ.get("VEND_SKIP_SELF_CHECK") == "1":
         return
     result = check_self(fetch=False, use_cache=True)
     if result.status == "behind":
         remote = result.remote_commit[:7] if result.remote_commit else "?"
         local = result.local_commit[:7] if result.local_commit else "?"
         print(
-            f"\nNote: git-updater update available ({local} -> {remote}). "
-            f"Run: git-updater self-check --fetch  |  git-updater self-update",
+            f"\nNote: vend update available ({local} -> {remote}). "
+            f"Run: vend self-check --fetch  |  vend self-update",
             file=sys.stderr,
         )
 
@@ -538,7 +538,7 @@ def apply_self_update(
     """Fast-forward this checkout from remotes that are descendants of HEAD, then reinstall."""
     root = install_root()
     if not (root / ".git").exists():
-        message = "git-updater is not a git checkout - clone from GitHub to self-update."
+        message = "vend is not a git checkout - clone from GitHub to self-update."
         if interactive:
             raise SystemExit(message)
         return observed or check_self(fetch=False, use_cache=True)
@@ -557,8 +557,8 @@ def apply_self_update(
         "dirty": "Refusing to self-update: working tree has local changes.",
         "diverged": "Refusing to self-update: diverged from upstream.",
         "unknown": "Could not determine upstream state.",
-        "ahead": "Local git-updater is ahead of upstream - not pulling.",
-        "no-local-git": "git-updater is not a git checkout - clone from GitHub to self-update.",
+        "ahead": "Local vend is ahead of upstream - not pulling.",
+        "no-local-git": "vend is not a git checkout - clone from GitHub to self-update.",
     }
     if result.status != "behind":
         message = refuse.get(
@@ -568,7 +568,7 @@ def apply_self_update(
             raise SystemExit(message)
         if result.status in ("dirty", "diverged"):
             print(
-                f"\nNote: git-updater {result.status} - skip self-update.",
+                f"\nNote: vend {result.status} - skip self-update.",
                 file=sys.stderr,
             )
         return result
@@ -582,7 +582,7 @@ def apply_self_update(
 
     branch = result.branch or current_branch(root) or "main"
     ref = result.sync_ref or f"origin/{branch}"
-    print(f"-> git-updater (self)")
+    print(f"-> vend (self)")
     print(f"  git merge --ff-only {ref}")
     try:
         run_git(root, "merge", "--ff-only", ref)
@@ -631,7 +631,7 @@ def _pin_catalog_self(
 
 def maybe_apply_self_update() -> None:
     """Observe at most once per TTL; patch only when residual is a safe fast-forward."""
-    if os.environ.get("GIT_UPDATER_SKIP_SELF_CHECK") == "1":
+    if os.environ.get("VEND_SKIP_SELF_CHECK") == "1":
         return
     cached = load_self_check_cache()
     if cached and cache_is_fresh(cached, fetch=False):
@@ -832,7 +832,7 @@ def suggested_remote_name(url: str) -> str:
     parts = github_owner_repo(remote_id_from_url(url), url)
     if parts:
         return parts[0]
-    return "git-updater"
+    return "vend"
 
 
 def ensure_remote(path: Path, url: str) -> str | None:
@@ -957,8 +957,8 @@ def self_hook_entry(root: Path) -> RepoEntry:
     origin = read_origin(root)
     remote, url = origin if origin else ("", "")
     return RepoEntry(
-        name="git-updater",
-        remote=remote or "git-updater",
+        name="vend",
+        remote=remote or "vend",
         url=url,
         path=str(root),
         branch=current_branch(root) or "main",
@@ -985,7 +985,7 @@ def is_self_checkout(catalog: Catalog, entry: RepoEntry) -> bool:
 
 
 def should_defer_self(args: argparse.Namespace, catalog: Catalog, entry: RepoEntry) -> bool:
-    """Skip catalog git-updater during bulk update; self-update runs after."""
+    """Skip catalog vend during bulk update; self-update runs after."""
     if getattr(args, "name", None):
         return False
     if getattr(args, "no_self_check", False):
@@ -1182,24 +1182,24 @@ def log_hook_pin(message: str) -> None:
         handle.write(f"{stamp} {message}\n")
 
 
-def resolve_git_updater_invoke() -> str:
-    if shutil.which("git-updater"):
-        return "git-updater"
-    script = install_root() / "git_updater.py"
+def resolve_vend_invoke() -> str:
+    if shutil.which("vend"):
+        return "vend"
+    script = install_root() / "vend.py"
     if shutil.which("py"):
         return f'py -3 "{script}"'
     for name in ("python3", "python"):
         exe = shutil.which(name)
         if exe:
             return f'"{exe}" "{script}"'
-    return "git-updater"
+    return "vend"
 
 
 def pin_hook_script(hook_name: str, invoke: str) -> str:
     lines = [
         "#!/bin/sh",
         f"# {PIN_HOOK_MARKER}",
-        'LOG="${HOME:-$USERPROFILE}/.git-updater/logs/hook-pin.log"',
+        'LOG="${HOME:-$USERPROFILE}/.vend/logs/hook-pin.log"',
         'mkdir -p "$(dirname "$LOG")" 2>/dev/null || true',
     ]
     if hook_name == "post-checkout":
@@ -1214,7 +1214,7 @@ def install_pin_hooks(repo_path: Path, *, force: bool = False) -> tuple[list[str
     hooks_dir = repo_path / ".git" / "hooks"
     if not hooks_dir.is_dir():
         return [], [f"missing .git/hooks under {repo_path}"]
-    invoke = resolve_git_updater_invoke()
+    invoke = resolve_vend_invoke()
     installed: list[str] = []
     skipped: list[str] = []
     for hook_name in PIN_HOOK_NAMES:
@@ -1333,7 +1333,7 @@ def resolve_lock_root(lock_path: Path, data: dict[str, Any], override: str | Non
 def load_lock(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("version") != LOCK_VERSION:
-        raise SystemExit(f"Unsupported vendor.lock version: {data.get('version')}")
+        raise SystemExit(f"Unsupported vend.lock version: {data.get('version')}")
     return data
 
 
@@ -1350,7 +1350,7 @@ def render_vendor_md(catalog: Catalog, exported_at: str | None = None) -> str:
     lines = [
         "# Vendor log",
         "",
-        "Clone root is chosen at replicate time (`git-updater replicate --root <path>`).",
+        "Clone root is chosen at replicate time (`vend replicate --root <path>`).",
         f"Exported: {ts}",
         "",
         "| Name | Remote | Branch | Commit | Install |",
@@ -1374,7 +1374,7 @@ def render_vendor_md(catalog: Catalog, exported_at: str | None = None) -> str:
 
 def export_lock(catalog: Catalog, out: Path) -> None:
     save_lock(out, lock_from_catalog(catalog))
-    md_path = out.parent / "VENDOR.md"
+    md_path = out.parent / "VEND.md"
     md_path.write_text(render_vendor_md(catalog), encoding="utf-8")
     print(f"Wrote {out}")
     print(f"Wrote {md_path}")
@@ -1717,7 +1717,7 @@ def consolidate_repo(
         print(f"  merge/rebase already in progress ({len(conflicts)} conflict(s))")
         for f in conflicts[:10]:
             print(f"    {f}")
-        print(f"  fix files, then: git-updater consolidate --continue {entry.name}")
+        print(f"  fix files, then: vend consolidate --continue {entry.name}")
         return "conflict", [f"in-progress {entry.name}"]
 
     if is_dirty(path):
@@ -1767,8 +1767,8 @@ def consolidate_repo(
         print(f"  conflict ({len(conflicts)} file(s))")
         for f in conflicts[:10]:
             print(f"    {f}")
-        print(f"  fix files, then: git-updater consolidate --continue {entry.name}")
-        print(f"  or abort: git-updater consolidate --abort {entry.name}")
+        print(f"  fix files, then: vend consolidate --continue {entry.name}")
+        print(f"  or abort: vend consolidate --abort {entry.name}")
         return "conflict", [f"conflict {entry.name}"]
 
     new_commit = current_commit(path)
@@ -2105,7 +2105,7 @@ def cmd_pin(args: argparse.Namespace) -> None:
         pin_entry(catalog, entry, quiet=args.quiet)
         save_catalog(catalog)
         if args.export:
-            out = Path(catalog.root) / "vendor.lock"
+            out = Path(catalog.root) / "vend.lock"
             export_lock(catalog, out)
         return
     repos = select_repos(catalog, args.name)
@@ -2113,7 +2113,7 @@ def cmd_pin(args: argparse.Namespace) -> None:
         pin_entry(catalog, entry, quiet=False)
     save_catalog(catalog)
     if args.export:
-        out = Path(catalog.root) / "vendor.lock"
+        out = Path(catalog.root) / "vend.lock"
         export_lock(catalog, out)
 
 
@@ -2231,7 +2231,7 @@ def cmd_push(args: argparse.Namespace) -> None:
 
 def cmd_export(args: argparse.Namespace) -> None:
     catalog = load_catalog()
-    out = Path(args.out) if args.out else Path(catalog.root) / "vendor.lock"
+    out = Path(args.out) if args.out else Path(catalog.root) / "vend.lock"
     export_lock(catalog, out)
 
 
@@ -2323,7 +2323,7 @@ def cmd_self_update(args: argparse.Namespace) -> None:
 
 def cmd_verify(args: argparse.Namespace) -> None:
     catalog = load_catalog()
-    lock_path = Path(args.lock) if args.lock else Path(catalog.root) / "vendor.lock"
+    lock_path = Path(args.lock) if args.lock else Path(catalog.root) / "vend.lock"
     if lock_path.exists():
         data = load_lock(lock_path)
         entries = [RepoEntry.from_dict(r) for r in data.get("repos", [])]
@@ -2360,7 +2360,7 @@ def package_version() -> str:
     try:
         from importlib.metadata import version
 
-        return version("git-updater")
+        return version("vend")
     except Exception:
         return "0.1.0"
 
@@ -2506,11 +2506,11 @@ def render_man(spec: dict[str, Any] | None = None) -> str:
     lines.extend(
         [
             ".SH FILES",
-            "~/.git-updater/catalog.json",
+            "~/.vend/catalog.json",
             ".br",
             "Machine-local catalog (clone root, pins).",
             ".br",
-            "<clone-root>/vendor.lock",
+            "<clone-root>/vend.lock",
             ".br",
             "Shareable SHA pins (relative paths only).",
             ".SH EXIT STATUS",
@@ -2588,9 +2588,9 @@ def cmd_man(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="git-updater",
-        description="Track git repos, pin commits, export vendor.lock, replicate stacks.",
-        epilog="Machine-readable: git-updater --help-json [COMMAND]. Man page: git-updater man.",
+        prog="vend",
+        description="Track git repos, pin commits, export vend.lock, replicate stacks.",
+        epilog="Machine-readable: vend --help-json [COMMAND]. Man page: vend man.",
     )
     parser.add_argument(
         "--no-self-check",
@@ -2639,7 +2639,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--branch", default="main", help="Branch to clone (default: main)")
     p.add_argument(
         "--install",
-        help="Override install hook (default: read .git-updater.yaml from repo)",
+        help="Override install hook (default: read vend.yml from repo)",
     )
     p.set_defaults(func=cmd_add)
 
@@ -2649,13 +2649,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--branch", help="Override branch")
     p.add_argument(
         "--install",
-        help="Override install hook (default: read .git-updater.yaml from repo)",
+        help="Override install hook (default: read vend.yml from repo)",
     )
     p.set_defaults(func=cmd_adopt)
 
     p = sub.add_parser(
         "sync-hooks",
-        help="Refresh catalog install/update commands from each repo's .git-updater manifest",
+        help="Refresh catalog install/update commands from each repo's vend.yml manifest",
     )
     p.add_argument("name", nargs="?", help="Single repo")
     p.set_defaults(func=cmd_sync_hooks)
@@ -2679,9 +2679,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--quiet",
         action="store_true",
-        help="No stdout; failures log to ~/.git-updater/logs/hook-pin.log",
+        help="No stdout; failures log to ~/.vend/logs/hook-pin.log",
     )
-    p.add_argument("--export", action="store_true", help="Also write vendor.lock")
+    p.add_argument("--export", action="store_true", help="Also write vend.lock")
     p.set_defaults(func=cmd_pin)
 
     p = sub.add_parser(
@@ -2731,12 +2731,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", nargs="?", help="Single repo")
     p.set_defaults(func=cmd_push)
 
-    p = sub.add_parser("export", help="Write vendor.lock and VENDOR.md")
-    p.add_argument("--out", help="Lock file path (default: <root>/vendor.lock)")
+    p = sub.add_parser("export", help="Write vend.lock and VENDOR.md")
+    p.add_argument("--out", help="Lock file path (default: <root>/vend.lock)")
     p.set_defaults(func=cmd_export)
 
-    p = sub.add_parser("replicate", help="Bootstrap stack from vendor.lock")
-    p.add_argument("lockfile", help="Path to vendor.lock")
+    p = sub.add_parser("replicate", help="Bootstrap stack from vend.lock")
+    p.add_argument("lockfile", help="Path to vend.lock")
     p.add_argument(
         "--root",
         help="Clone root on this machine (default: directory that contains the lockfile)",
@@ -2745,11 +2745,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_replicate)
 
     p = sub.add_parser("verify", help="Check clones match lock (exit 1 on drift)")
-    p.add_argument("--lock", help="Lock file (default: <root>/vendor.lock)")
+    p.add_argument("--lock", help="Lock file (default: <root>/vend.lock)")
     p.add_argument("--root", help="Override root")
     p.set_defaults(func=cmd_verify)
 
-    p = sub.add_parser("self-check", help="Check whether git-updater itself is up to date")
+    p = sub.add_parser("self-check", help="Check whether vend itself is up to date")
     p.add_argument(
         "--fetch",
         action="store_true",
@@ -2760,13 +2760,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "self-update",
-        help="Fast-forward git-updater from descendant remotes and reinstall",
+        help="Fast-forward vend from descendant remotes and reinstall",
     )
     p.set_defaults(func=cmd_self_update)
 
     p = sub.add_parser(
         "install-skills",
-        help="Copy the git-updater agent skill to ~/.cursor/skills and ~/.agents/skills",
+        help="Copy the vend agent skill to ~/.cursor/skills and ~/.agents/skills",
     )
     p.set_defaults(func=cmd_install_skills)
 

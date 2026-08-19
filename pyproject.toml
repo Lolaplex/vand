@@ -3,17 +3,17 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "git-updater"
+name = "vend"
 version = "0.1.0"
-description = "Catalog git clones, pin SHAs in vendor.lock, replicate stacks."
+description = "Catalog source instances, pin revisions in vend.lock, replicate stacks."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
-authors = [{ name = "git-updater contributors" }]
+authors = [{ name = "vend contributors" }]
 
 [project.scripts]
-git-updater = "git_updater:main"
+vend = "vend:main"
 
 [tool.setuptools]
-py-modules = ["git_updater"]
+py-modules = ["vend"]
 
