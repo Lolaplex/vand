@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "name": "agents-memory",
+      "source": {
+        "kind": "vcs",
+        "scheme": "git",
+        "origin": "https://github.com/Lolaplex/agents-memory.git",
+        "revision": "a2c7812a667a46792a26ea719ad7ea83f875b202"
+      },
+      "target": "agents-memory"
+    }
+  ]
+}

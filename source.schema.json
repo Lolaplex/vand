@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "source.yml quotient manifest",
+  "type": "object",
+  "required": ["version"],
+  "properties": {
+    "version": { "type": "integer", "const": 1 },
+    "source": {
+      "type": "object",
+      "properties": {
+        "kind": { "type": "string" },
+        "scheme": { "type": "string" },
+        "origin": { "type": "string" },
+        "revision": { "type": "string" },
+        "digest": { "type": "string" }
+      }
+    },
+    "target": { "type": "string" },
+    "install": {
+      "description": "Shell command(s) after acquire/materialize",
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string" } },
+        {
+          "type": "object",
+          "properties": {
+            "run": { "type": "string" },
+            "script": { "type": "string" },
+            "shell": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "update": {
+      "description": "Shell command(s) after successful update when revision changed"
+    },
+    "verify": {
+      "description": "Optional check command (vand verify)"
+    },
+    "deinstall": {
+      "description": "Optional prelude before vand deinstall purge"
+    }
+  }
+}
