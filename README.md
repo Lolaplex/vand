@@ -1,8 +1,8 @@
 # vand
 
-Track shared git repos on your machine, pin them to exact commits, and export a **shareable `vand.lock`** so another computer can replicate the whole stack with one command.
+Vand materializes and pins external source instances, delegates lifecycle actions to their native tools, and records provenance independently of the source backend.
 
-Works with **any git remote** — GitHub, GitLab, Bitbucket, self-hosted, `file://` paths, and local folder clones — not just `github.com`.
+Works with **any git remote** — GitHub, GitLab, Bitbucket, self-hosted, `file://` paths, and local folder clones — not just `github.com`. Git is the first source driver; the protocol is source-agnostic (`source.yml` manifests + `origins.lock` provenance ledger).
 
 Manual CLI only — no background scheduler. For general cron/timer automation, a separate desktop scheduler project is planned later.
 
@@ -14,9 +14,19 @@ Manual CLI only — no background scheduler. For general cron/timer automation, 
 | **[myrepos](https://myrepos.branchable.com/)** (`mr update`) | Update many repos | No exact SHA lockfile for replication |
 | **[hawser](https://github.com/Nastwinns/hawser)** (`haw sync`) | Multi-repo lockfile + verify | Rust stack, heavier scope |
 | **[Repo Family](https://github.com/JohnsonArnek/Github-Family)** | Control repo + lock | No personal catalog curation |
-| **vand** | Catalog + `vand.lock` + `replicate` | Small Python stdlib CLI |
+| **vand** | Catalog + `origins.lock` + `replicate` | Small Python stdlib CLI |
 
-Per-app library pins (a `vand.lock` *inside* one project) pin trees in that project. vand pins **whole repos** across a clone root on your machine.
+Per-app library pins inside one project are separate. vand pins **whole source instances** across a clone root on your machine.
+
+## Three artifacts
+
+| Artifact | Location | Job |
+|----------|----------|-----|
+| **Manifest** `source.yml` | inside each source tree | Quotient map: `install` / `update` / `verify` / `deinstall` → shell commands |
+| **Provenance ledger** `origins.lock` | clone root | Completed source facts: origin + pinned revision + target path (no hooks) |
+| **Execution log** | `~/.vand/logs/` | Attempts, timestamps, exit codes — never in source trees |
+
+Do not confuse lock and log. A failed install must not produce a success-like ledger entry.
 
 ## Install
 
@@ -37,7 +47,7 @@ That puts `vand` on PATH (Windows: the Python `Scripts` folder). Editable (`-e`)
 
 Without installing, you can still run `python vand.py` or `vand.cmd` from this directory.
 
-**Coding agents:** follow [`AGENTS.md`](AGENTS.md). That file is the install spec. This README is the map. First-run is `python vand.py init --root <clone-root>` (catalog, pip -e, skills, adopt self, shared.lock). Usage skill: [`skills/vand/SKILL.md`](skills/vand/SKILL.md).
+**Coding agents:** follow [`AGENTS.md`](AGENTS.md). That file is the install spec. This README is the map. First-run is `python vand.py init --root <clone-root>` (catalog, pip -e, skills, adopt self, `examples/origins.lock`). Usage skill: [`skills/vand/SKILL.md`](skills/vand/SKILL.md).
 
 ## Help that machines can read
 
@@ -62,13 +72,13 @@ Do **not** commit `man/` or in-repo `.cursor/` skill copies — both are gitigno
 ## Quick start
 
 ```powershell
-# 1. First-run (catalog + PATH + skills + adopt this clone + shared.lock)
+# 1. First-run (catalog + PATH + skills + adopt this clone + origins.lock)
 vand init --root <clone-root>
 
 # 2. See existing clones not yet tracked
 vand scan
 
-# 3. Register an existing folder (reads vand.yml if present)
+# 3. Register an existing folder (reads source.yml if present)
 vand adopt <folder>
 vand adopt <folder> --install "make install"  # optional override
 
@@ -76,9 +86,9 @@ vand adopt <folder> --install "make install"  # optional override
 vand status
 vand status --fetch
 
-# 5. Export shareable lock + human vendor log
+# 5. Export shareable ledger + human provenance log
 vand export
-# -> <clone-root>/vand.lock
+# -> <clone-root>/origins.lock
 # -> <clone-root>/VAND.md
 ```
 
@@ -94,7 +104,7 @@ git clone https://github.com/Lolaplex/vand.git
 python vand/vand.py init --root .
 ```
 
-`init` creates the catalog, `pip install -e` this clone, installs the agent skill, adopts vand, replicates `examples/shared.lock`, and adopts those repos. If you run `init` inside the vand folder with default `--root .`, the clone root becomes the parent.
+`init` creates the catalog, `pip install -e` this clone, installs the agent skill, adopts vand, replicates `examples/origins.lock`, and adopts those repos. If you run `init` inside the vand folder with default `--root .`, the clone root becomes the parent.
 
 Daily sync (pull when the other person pushed):
 
@@ -107,20 +117,20 @@ vand push agent-memory   # after your own commits
 
 ## On another machine
 
-Copy `vand.lock` (and optionally `VAND.md`), then:
+Copy `origins.lock` (and optionally `VAND.md`), then:
 
 ```powershell
-vand replicate vand.lock --root <clone-root>
+vand replicate origins.lock --root <clone-root>
 ```
 
 If you omit `--root`, clones land next to the lockfile. Absolute `root` values from another computer are ignored.
 
-Clones missing repos, checks out exact SHAs, runs each repo's `install` hook.
+Clones missing targets, checks out exact revisions, runs each repo's `install` hook from its manifest.
 
 Dry run first:
 
 ```powershell
-vand replicate vand.lock --root <clone-root> --dry-run
+vand replicate origins.lock --root <clone-root> --dry-run
 ```
 
 ## Daily workflow
@@ -132,9 +142,10 @@ vand consolidate --continue NAME   # after fixing conflict markers
 vand consolidate --abort NAME      # abort stuck merge/rebase
 vand push            # push tracking branches; re-pin HEAD
 vand pin             # pin catalog to current HEAD after local commits
-vand pin --export    # pin + write vand.lock
+vand pin --export    # pin + write origins.lock
 vand hook-sync       # once: install git hooks so plain git keeps catalog pinned
-vand verify          # exit 1 if any clone != lock (CI gate)
+vand verify          # exit 1 if any clone != ledger (CI gate); runs verify hooks
+vand deinstall NAME  # remove from catalog + purge target (default)
 ```
 
 Dirty or diverged repos are **never** force-reset. Use `consolidate` when `update` stops at diverged/ff-only failures, then `pin`.
@@ -147,7 +158,7 @@ Dirty or diverged repos are **never** force-reset. Use `consolidate` when `updat
 
 | Command | What it syncs | Where |
 |---------|----------------|-------|
-| **`sync-hooks`** | **Manifest** install/update shell commands from each repo's `vand.yml` into the catalog | `catalog.json` fields |
+| **`sync-hooks`** | **Manifest** install/update shell commands from each repo's `source.yml` into the catalog | `catalog.json` fields |
 | **`hook-sync`** | **Git** hooks that re-pin the catalog after commit / pull / rebase / checkout | `<clone>/.git/hooks/` |
 
 Do not confuse them. `sync-hooks` does not install pin hooks. `hook-sync` does not read manifests.
@@ -176,7 +187,7 @@ Each hook runs `vand pin --here --quiet`. That looks up the catalog row by this 
 
 `git push` does not move HEAD. Commit/pull already pinned the SHA; `status --fetch` is enough to see whether origin is caught up.
 
-Do not set global `core.hooksPath` (Git replaces per-repo hooks instead of chaining). Do not alias `git`. Do not auto-export `vand.lock` from hooks (`pin --export` / `export` stay explicit). Foreign hook files are left alone unless `--force` (appends the pin block after the existing script).
+Do not set global `core.hooksPath` (Git replaces per-repo hooks instead of chaining). Do not alias `git`. Do not auto-export `origins.lock` from hooks (`pin --export` / `export` stay explicit). Foreign hook files are left alone unless `--force` (appends the pin block after the existing script).
 
 `desktop-commander` is the later scheduler clock (`vand update` at 09:00). Pin hooks are the residual patch for ad-hoc git in the working tree.
 
@@ -188,29 +199,31 @@ Do not set global `core.hooksPath` (Git replaces per-repo hooks instead of chain
 | HTTPS / SSH | `https://gitlab.com/group/project.git`, `git@host:org/repo.git` |
 | Local path | a folder on disk, or `file://` URL |
 
-`adopt` reads `origin` (push target). Extra remotes are stored as `mirrors` only if they **already contain the pinned SHA**. `vand.lock` stores `remote` (id), `url` (clone source), and optional `mirrors` (other fetch URLs for that same commit). Older locks with only `github` still load.
+`adopt` reads `origin` (push target). Extra remotes are stored as `mirrors` only if they **already contain the pinned SHA**. `origins.lock` stores source origin + pinned revision + target. Catalog may also cache hooks and git `mirrors` for fetch. Read aliases: `vendor.lock`, `vand.lock`, `shared.lock`. v1 locks are not loaded — re-export after upgrade.
 
 **Pins are SHAs.** `Klix927/agent-memory` and `Lolaplex/agent-memory` are different remotes. They are fetch sources for a pin only when that exact commit exists there. `replicate` / `install` fetch `url` plus listed `mirrors` until the lock SHA is present, then check out that SHA. `update` / `push` still follow **origin**. A GitHub repo *name* match is not identity.
 
-## For repo authors — `vand.yml`
+## For repo authors — `source.yml`
 
-Stop writing install guides only in README. Add a **machine-readable manifest** at the repo root:
+Stop writing install guides only in README. Add a **machine-readable manifest** at the repo root (`version: 1` required):
 
 ```yaml
-# vand.yml
+# source.yml
 version: 1
 install: npm ci && npm run build
 update: npm ci
 verify: npm test
+deinstall: optional prelude before vand deinstall purge
 ```
 
-Also supported: `vand.yaml`, `vand.json`.
+Also read via aliases: `vand.yml`, `vand.yaml`, `vend.ini`, json variants.
 
 | Key | When it runs |
 |-----|----------------|
 | `install` | After `add`, `install`, `replicate` |
-| `update` | After `update` / `consolidate` when the commit changed (defaults to `install`) |
-| `verify` | Reserved — not executed yet |
+| `update` | After `update` / `consolidate` when the revision changed (defaults to `install`) |
+| `verify` | `vand verify` |
+| `deinstall` | Optional prelude before `vand deinstall` purge |
 
 Commands can be a string, a list (run in sequence with `&&`), or `{ run: scripts/setup.sh, shell: bash }`.
 
@@ -221,9 +234,9 @@ vand scan          # shows [manifest file] next to repos that declare hooks
 vand sync-hooks    # refresh catalog from on-disk manifests
 ```
 
-The manifest is **in the repo** — it travels with the code, gets pinned in `vand.lock`, and works on every machine after `replicate`. No Nix required.
+The manifest is **in the repo** — it travels with the code and works on every machine after `replicate`. Hooks are not stored in `origins.lock`.
 
-See [`vand.schema.json`](vand.schema.json) for the JSON shape.
+See [`source.schema.json`](source.schema.json) for the JSON shape.
 
 ## Where files live
 
@@ -233,19 +246,21 @@ See [`vand.schema.json`](vand.schema.json) for the JSON shape.
 | `~/.vand/logs/` | Timestamped logs from update/install/replicate |
 | `~/.vand/logs/hook-pin.log` | Quiet pin failures from git hooks |
 | `<clone>/.git/hooks/` | Pin hooks installed by `hook-sync` (not in the clone's tree) |
-| `<clone-root>/vand.lock` | Shareable pin snapshot (relative paths only; no machine root) |
-| `<clone-root>/VAND.md` | Human-readable vendor table |
+| `<clone-root>/origins.lock` | Shareable provenance ledger (relative targets only) |
+| `<clone-root>/VAND.md` | Human-readable provenance table |
+| `<repo>/source.yml` | Quotient manifest (install/update/verify/deinstall) |
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `init [--root PATH]` | First-run: catalog, pip -e, skills, adopt self, replicate `examples/shared.lock` |
+| `init [--root PATH]` | First-run: catalog, pip -e, skills, adopt self, replicate `examples/origins.lock` |
 | `scan` | Git folders under root not in catalog |
 | `add owner/repo [--install CMD]` | Clone + register |
 | `adopt FOLDER [--install CMD]` | Register existing clone (auto-reads manifest; runs `hook-sync`) |
 | `sync-hooks [NAME]` | Refresh catalog **install/update commands** from repo manifests (not git hooks) |
-| `rm NAME` | Remove from catalog (keeps folder) |
+| `rm NAME` | Remove from catalog (keeps folder; same as `deinstall --keep`) |
+| `deinstall NAME [--keep]` | Remove from catalog; default purges target directory |
 | `status [NAME] [--fetch]` | pinned / behind / ahead / dirty / diverged / missing |
 | `update [NAME]` | Fetch; ff-only if clean |
 | `consolidate [NAME] [--rebase]` | Merge/rebase when update cannot ff-only |
@@ -256,9 +271,9 @@ See [`vand.schema.json`](vand.schema.json) for the JSON shape.
 | `pin --here [--quiet]` | Pin catalog row for cwd; `--quiet` for git hooks (logs on failure) |
 | `hook-sync [NAME] [--force]` | Install **git** pin hooks in `.git/hooks/` |
 | `install [NAME]` | Clone missing + checkout pin + install hooks |
-| `export [--out PATH]` | Write vand.lock + VAND.md |
-| `replicate LOCK [--root PATH] [--dry-run]` | Bootstrap from lock |
-| `verify [--lock PATH]` | Drift check |
+| `export [--out PATH]` | Write origins.lock + VAND.md |
+| `replicate LOCK [--root PATH] [--dry-run]` | Bootstrap from ledger |
+| `verify [--lock PATH]` | Drift check + verify hooks |
 | `self-check [--fetch] [--json]` | Check if vand itself is up to date |
 | `self-update` | Fast-forward this checkout (only refs that are descendants of HEAD) + reinstall |
 | `install-skills` | Copy agent skill to `~/.cursor/skills` and `~/.agents/skills` |
@@ -267,25 +282,23 @@ See [`vand.schema.json`](vand.schema.json) for the JSON shape.
 
 Global: `--no-self-check` skips the 24h residual self-update. `--help-json` prints the CLI spec and exits.
 
-## vand.lock format (v1)
+## origins.lock format (v2)
 
-Portable. No absolute paths. `path` is relative to the clone root you pass to `replicate`.
+Portable provenance only — no hooks, no branch. `target` is relative to the clone root you pass to `replicate`.
 
 ```json
 {
-  "version": 1,
-  "repos": [
+  "version": 2,
+  "sources": [
     {
       "name": "example-app",
-      "remote": "acme/example-app",
-      "github": "acme/example-app",
-      "url": "https://github.com/acme/example-app.git",
-      "path": "example-app",
-      "branch": "main",
-      "commit": "b6dfd52…",
-      "install": "npm ci && npm run build",
-      "update": "npm ci",
-      "mirrors": ["https://github.com/you/example-app.git"]
+      "source": {
+        "kind": "vcs",
+        "scheme": "git",
+        "origin": "https://github.com/acme/example-app.git",
+        "revision": "b6dfd52…"
+      },
+      "target": "example-app"
     }
   ]
 }
