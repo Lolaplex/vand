@@ -1,2 +1,2 @@
 @echo off
-python "%~dp0vend.py" %*
+python -m vand %*
