@@ -18,8 +18,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+__version__ = "1.0.0"
+
 CATALOG_VERSION = 1
 LOCK_VERSION = 1
+MANIFEST_PROTOCOL_VERSION = 1
 CONFIG_DIR = Path.home() / ".vand"
 CATALOG_PATH = CONFIG_DIR / "catalog.json"
 LOG_DIR = CONFIG_DIR / "logs"
@@ -34,14 +37,29 @@ SKILL_PATHS_END = "<!-- /vand-paths -->"
 PIN_HOOK_MARKER = "vand-managed: pin --here"
 PIN_HOOK_NAMES = ("post-commit", "post-merge", "post-rewrite", "post-checkout")
 
-MANIFEST_FILENAMES = (
-    "vand.json",
-    "vand.yaml",
+MANIFEST_READ_FILENAMES = (
+    "source.yml",
+    "source.yaml",
+    "source.json",
     "vand.yml",
-    ".vand.json",
-    ".vand.yaml",
-    ".vand.yml",
+    "vand.yaml",
+    "vand.json",
+    "vand.ini",
+    "vend.yml",
+    "vend.yaml",
+    "vend.json",
+    "vend.ini",
 )
+
+LOCK_READ_FILENAMES = (
+    "origins.lock",
+    "vendor.lock",
+    "vand.lock",
+    "shared.lock",
+)
+
+LOCK_WRITE_FILENAME = "origins.lock"
+MANIFEST_WRITE_FILENAME = "source.yml"
 
 GITHUB_RE = re.compile(
     r"(?:github\.com[/:]|git@github\.com:)([^/]+)/([^/\s]+?)(?:\.git)?/?$"
@@ -49,56 +67,181 @@ GITHUB_RE = re.compile(
 
 
 @dataclass
-class RepoEntry:
+class SourceRef:
+    kind: str
+    scheme: str
+    origin: str
+    revision: str | None = None
+    digest: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "kind": self.kind,
+            "scheme": self.scheme,
+            "origin": self.origin,
+        }
+        if self.revision:
+            payload["revision"] = self.revision
+        if self.digest:
+            payload["digest"] = self.digest
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SourceRef:
+        return cls(
+            kind=data["kind"],
+            scheme=data.get("scheme", "git"),
+            origin=data["origin"],
+            revision=data.get("revision"),
+            digest=data.get("digest"),
+        )
+
+    @classmethod
+    def from_git_url(cls, url: str, revision: str | None = None) -> SourceRef:
+        return cls(kind="vcs", scheme="git", origin=url, revision=revision)
+
+
+@dataclass
+class SourceInstance:
     name: str
-    remote: str
-    url: str
-    path: str
-    branch: str
-    commit: str
-    install: str | None = None
-    update: str | None = None
+    source: SourceRef
+    target: str
+    hooks: dict[str, str] = field(default_factory=dict)
+    branch: str = "main"
     mirrors: list[str] = field(default_factory=list)
 
     @property
+    def path(self) -> str:
+        return self.target
+
+    @property
+    def commit(self) -> str:
+        return self.source.revision or ""
+
+    @commit.setter
+    def commit(self, value: str) -> None:
+        self.source.revision = value
+
+    @property
+    def url(self) -> str:
+        return self.source.origin
+
+    @property
+    def remote(self) -> str:
+        return remote_id_from_url(self.source.origin)
+
+    @property
     def github(self) -> str:
-        """Backward-compatible alias; same as remote id."""
         return self.remote
 
+    @property
+    def install(self) -> str | None:
+        return self.hooks.get("install")
+
+    @install.setter
+    def install(self, value: str | None) -> None:
+        if value:
+            self.hooks["install"] = value
+        else:
+            self.hooks.pop("install", None)
+
+    @property
+    def update(self) -> str | None:
+        return self.hooks.get("update")
+
+    @update.setter
+    def update(self, value: str | None) -> None:
+        if value:
+            self.hooks["update"] = value
+        else:
+            self.hooks.pop("update", None)
+
     def to_dict(self) -> dict[str, Any]:
-        d = {
+        payload: dict[str, Any] = {
             "name": self.name,
-            "remote": self.remote,
-            "github": self.remote,
-            "url": self.url,
-            "path": self.path,
-            "branch": self.branch,
-            "commit": self.commit,
+            "source": self.source.to_dict(),
+            "target": self.target,
         }
-        if self.install is not None:
-            d["install"] = self.install
-        if self.update is not None:
-            d["update"] = self.update
+        if self.branch != "main":
+            payload["branch"] = self.branch
+        if self.hooks:
+            payload["hooks"] = dict(self.hooks)
         if self.mirrors:
-            d["mirrors"] = list(self.mirrors)
-        return d
+            payload["mirrors"] = list(self.mirrors)
+        return payload
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> RepoEntry:
-        remote = data.get("remote") or data.get("github") or data.get("url", "?")
+    def from_dict(cls, data: dict[str, Any]) -> SourceInstance:
+        if "source" in data:
+            hooks = dict(data.get("hooks") or {})
+            if data.get("install") and "install" not in hooks:
+                hooks["install"] = data["install"]
+            if data.get("update") and "update" not in hooks:
+                hooks["update"] = data["update"]
+            mirrors = data.get("mirrors") or []
+            if isinstance(mirrors, str):
+                mirrors = [mirrors]
+            return cls(
+                name=data["name"],
+                source=SourceRef.from_dict(data["source"]),
+                target=data.get("target") or data.get("path", ""),
+                hooks=hooks,
+                branch=data.get("branch", "main"),
+                mirrors=[str(item) for item in mirrors if str(item).strip()],
+            )
+        url = data.get("url", "")
+        remote = data.get("remote") or data.get("github") or url or "?"
+        if not url and remote and not remote.startswith("local:"):
+            if remote.count("/") == 1 and "://" not in remote:
+                owner, repo = remote.split("/", 1)
+                url = f"https://github.com/{owner}/{repo}.git"
+            else:
+                url = remote
+        hooks: dict[str, str] = {}
+        if data.get("install"):
+            hooks["install"] = data["install"]
+        if data.get("update"):
+            hooks["update"] = data["update"]
         mirrors = data.get("mirrors") or []
         if isinstance(mirrors, str):
             mirrors = [mirrors]
         return cls(
             name=data["name"],
-            remote=remote,
-            url=data["url"],
-            path=data["path"],
-            branch=data["branch"],
-            commit=data["commit"],
-            install=data.get("install"),
-            update=data.get("update"),
+            source=SourceRef.from_git_url(url, data.get("commit")),
+            target=data.get("path") or data.get("target", ""),
+            hooks=hooks,
+            branch=data.get("branch", "main"),
             mirrors=[str(item) for item in mirrors if str(item).strip()],
+        )
+
+
+class RepoEntry(SourceInstance):
+    """Legacy constructor for tests and catalog rows stored as git-centric dicts."""
+
+    def __init__(
+        self,
+        name: str,
+        remote: str,
+        url: str,
+        path: str,
+        branch: str,
+        commit: str,
+        install: str | None = None,
+        update: str | None = None,
+        mirrors: list[str] | None = None,
+    ) -> None:
+        hooks: dict[str, str] = {}
+        if install:
+            hooks["install"] = install
+        if update:
+            hooks["update"] = update
+        super().__init__(
+            name=name,
+            source=SourceRef.from_git_url(url, commit),
+            target=path.replace("\\", "/"),
+            hooks=hooks,
+            branch=branch,
+            mirrors=list(mirrors or []),
         )
 
 
@@ -106,24 +249,25 @@ class RepoEntry:
 class Catalog:
     version: int
     root: str
-    repos: list[RepoEntry] = field(default_factory=list)
+    repos: list[SourceInstance] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": self.version,
             "root": self.root,
-            "repos": [r.to_dict() for r in self.repos],
+            "sources": [r.to_dict() for r in self.repos],
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Catalog:
+        raw_items = data.get("sources") or data.get("repos") or []
         return cls(
             version=data.get("version", 1),
             root=data["root"],
-            repos=[RepoEntry.from_dict(r) for r in data.get("repos", [])],
+            repos=[SourceInstance.from_dict(item) for item in raw_items],
         )
 
-    def find(self, name: str) -> RepoEntry | None:
+    def find(self, name: str) -> SourceInstance | None:
         for repo in self.repos:
             if repo.name == name:
                 return repo
@@ -170,7 +314,12 @@ def write_log(command: str, lines: list[str]) -> Path:
 
 
 def install_root() -> Path:
-    return Path(__file__).resolve().parent
+    """Repo checkout root (contains pyproject.toml, skills/, examples/)."""
+    here = Path(__file__).resolve().parent
+    for ancestor in (here, *here.parents):
+        if (ancestor / "pyproject.toml").is_file():
+            return ancestor
+    return here
 
 
 def skill_template_path() -> Path:
@@ -195,7 +344,7 @@ def machine_skill_text(root: Path | None = None) -> str:
     block = (
         f"Install (engine): `{root_s}`\n"
         "Invoke (PATH): `vand` after `python -m pip install -e .` from that clone.\n"
-        f"Fallback: `python {root_s}/vand.py`\n"
+        f"Fallback: `python -m vand` (from the clone root `{root_s}`).\n"
         "Machine-readable spec: `vand --help-json` (or `vand --help-json COMMAND`).\n"
     )
     if SKILL_PATHS_BEGIN in template and SKILL_PATHS_END in template:
@@ -243,8 +392,51 @@ def infer_clone_root(root_arg: str) -> Path:
 
 
 def default_stack_lock() -> Path | None:
-    path = install_root() / "examples" / "shared.lock"
+    path = install_root() / "examples" / "origins.lock"
     return path if path.is_file() else None
+
+
+def find_lock_file(directory: Path) -> Path | None:
+    for name in LOCK_READ_FILENAMES:
+        candidate = directory / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def find_manifest_file(repo_path: Path) -> Path | None:
+    for name in MANIFEST_READ_FILENAMES:
+        candidate = repo_path / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+class GitDriver:
+    """Git source driver — wraps clone, checkout, verify."""
+
+    scheme = "git"
+
+    def acquire(self, url: str, dest: Path, branch: str) -> None:
+        clone_repo(url, dest, branch)
+
+    def materialize(
+        self,
+        path: Path,
+        revision: str,
+        extra_urls: list[str] | None = None,
+    ) -> None:
+        checkout_pin(path, revision, extra_urls)
+
+    def verify(self, path: Path, revision: str) -> bool:
+        head = current_commit(path)
+        return head == revision
+
+    @staticmethod
+    def for_ref(ref: SourceRef) -> GitDriver:
+        if ref.kind == "vcs" and ref.scheme == "git":
+            return GitDriver()
+        raise NotImplementedError(f"Unsupported source driver: {ref.kind}/{ref.scheme}")
 
 
 def resolve_self_remote(install_path: Path | None = None) -> str:
@@ -755,8 +947,8 @@ def parse_repo_spec(spec: str) -> tuple[str, str, str]:
     )
 
 
-def repo_abs_path(catalog: Catalog, entry: RepoEntry) -> Path:
-    return Path(catalog.root) / entry.path
+def repo_abs_path(catalog: Catalog, entry: SourceInstance) -> Path:
+    return Path(catalog.root) / entry.target
 
 
 def read_origin(entry_path: Path) -> tuple[str, str] | None:
@@ -859,7 +1051,7 @@ def ensure_remote(path: Path, url: str) -> str | None:
     return name
 
 
-def entry_fetch_urls(entry: RepoEntry) -> list[str]:
+def entry_fetch_urls(entry: SourceInstance) -> list[str]:
     urls: list[str] = []
     for candidate in [entry.url, *entry.mirrors]:
         if candidate and not any(urls_equivalent(candidate, existing) for existing in urls):
@@ -867,7 +1059,7 @@ def entry_fetch_urls(entry: RepoEntry) -> list[str]:
     return urls
 
 
-def attach_entry_remotes(path: Path, entry: RepoEntry) -> None:
+def attach_entry_remotes(path: Path, entry: SourceInstance) -> None:
     for url in entry_fetch_urls(entry):
         ensure_remote(path, url)
 
@@ -914,7 +1106,7 @@ def commit_exists(path: Path, commit: str) -> bool:
     return result.returncode == 0
 
 
-def pin_fetch_remote_names(path: Path, entry: RepoEntry) -> list[str]:
+def pin_fetch_remote_names(path: Path, entry: SourceInstance) -> list[str]:
     """Remotes we may fetch the pin SHA from. Not which branch tip to follow."""
     wanted = entry_fetch_urls(entry)
     names: list[str] = []
@@ -953,7 +1145,7 @@ def parse_rev(path: Path, ref: str) -> str | None:
     return sha or None
 
 
-def self_hook_entry(root: Path) -> RepoEntry:
+def self_hook_entry(root: Path) -> SourceInstance:
     origin = read_origin(root)
     remote, url = origin if origin else ("", "")
     return RepoEntry(
@@ -966,7 +1158,7 @@ def self_hook_entry(root: Path) -> RepoEntry:
     )
 
 
-def catalog_self_entry() -> tuple[Catalog, RepoEntry] | None:
+def catalog_self_entry() -> tuple[Catalog, SourceInstance] | None:
     if not CATALOG_PATH.exists():
         return None
     try:
@@ -980,11 +1172,11 @@ def catalog_self_entry() -> tuple[Catalog, RepoEntry] | None:
     return None
 
 
-def is_self_checkout(catalog: Catalog, entry: RepoEntry) -> bool:
+def is_self_checkout(catalog: Catalog, entry: SourceInstance) -> bool:
     return repo_abs_path(catalog, entry).resolve() == install_root().resolve()
 
 
-def should_defer_self(args: argparse.Namespace, catalog: Catalog, entry: RepoEntry) -> bool:
+def should_defer_self(args: argparse.Namespace, catalog: Catalog, entry: SourceInstance) -> bool:
     """Skip catalog vand during bulk update; self-update runs after."""
     if getattr(args, "name", None):
         return False
@@ -1122,7 +1314,7 @@ def ahead_behind(path: Path, branch: str) -> tuple[int, int]:
     return remote_ahead_behind(path, branch, "origin")
 
 
-def classify_repo(catalog: Catalog, entry: RepoEntry, fetch: bool = False) -> str:
+def classify_repo(catalog: Catalog, entry: SourceInstance, fetch: bool = False) -> str:
     path = repo_abs_path(catalog, entry)
     if not path.exists() or not (path / ".git").exists():
         return "missing"
@@ -1154,7 +1346,7 @@ def classify_repo(catalog: Catalog, entry: RepoEntry, fetch: bool = False) -> st
     return "pinned"
 
 
-def select_repos(catalog: Catalog, name: str | None) -> list[RepoEntry]:
+def select_repos(catalog: Catalog, name: str | None) -> list[SourceInstance]:
     if name:
         entry = catalog.find(name)
         if not entry:
@@ -1163,7 +1355,7 @@ def select_repos(catalog: Catalog, name: str | None) -> list[RepoEntry]:
     return list(catalog.repos)
 
 
-def catalog_entry_for_path(catalog: Catalog, path: Path) -> RepoEntry | None:
+def catalog_entry_for_path(catalog: Catalog, path: Path) -> SourceInstance | None:
     resolved = path.resolve()
     for entry in catalog.repos:
         try:
@@ -1185,13 +1377,13 @@ def log_hook_pin(message: str) -> None:
 def resolve_vand_invoke() -> str:
     if shutil.which("vand"):
         return "vand"
-    script = install_root() / "vand.py"
+    root = install_root()
     if shutil.which("py"):
-        return f'py -3 "{script}"'
+        return f'py -3 -m vand'
     for name in ("python3", "python"):
         exe = shutil.which(name)
         if exe:
-            return f'"{exe}" "{script}"'
+            return f'"{exe}" -m vand'
     return "vand"
 
 
@@ -1254,7 +1446,7 @@ def sync_pin_hooks(repo_path: Path, repo_name: str, *, force: bool = False) -> N
 
 
 def pin_entry(
-    catalog: Catalog, entry: RepoEntry, *, quiet: bool = False
+    catalog: Catalog, entry: SourceInstance, *, quiet: bool = False
 ) -> bool:
     """Pin catalog entry to HEAD. Returns True when commit changed."""
     path = repo_abs_path(catalog, entry)
@@ -1311,11 +1503,26 @@ def catalog_paths(catalog: Catalog) -> set[str]:
 
 
 def lock_from_catalog(catalog: Catalog) -> dict[str, Any]:
-    """Portable snapshot: relative paths only. Clone root is chosen at replicate time."""
+    """Portable provenance ledger: relative targets only, no hooks."""
     return {
         "version": LOCK_VERSION,
-        "repos": [r.to_dict() for r in catalog.repos],
+        "sources": [
+            {
+                "name": inst.name,
+                "source": inst.source.to_dict(),
+                "target": inst.target,
+            }
+            for inst in catalog.repos
+        ],
     }
+
+
+def lock_sources(data: dict[str, Any]) -> list[dict[str, Any]]:
+    return list(data.get("sources") or data.get("repos") or [])
+
+
+def instances_from_lock(data: dict[str, Any]) -> list[SourceInstance]:
+    return [SourceInstance.from_dict(raw) for raw in lock_sources(data)]
 
 
 def resolve_lock_root(lock_path: Path, data: dict[str, Any], override: str | None) -> Path:
@@ -1333,7 +1540,9 @@ def resolve_lock_root(lock_path: Path, data: dict[str, Any], override: str | Non
 def load_lock(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("version") != LOCK_VERSION:
-        raise SystemExit(f"Unsupported vand.lock version: {data.get('version')}")
+        raise SystemExit(
+            f"Unsupported origins.lock version: {data.get('version')} (expected {LOCK_VERSION})"
+        )
     return data
 
 
@@ -1348,44 +1557,50 @@ def save_lock(path: Path, data: dict[str, Any]) -> None:
 def render_vand_md(catalog: Catalog, exported_at: str | None = None) -> str:
     ts = exported_at or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        "# Vendor log",
+        "# Provenance log",
         "",
         "Clone root is chosen at replicate time (`vand replicate --root <path>`).",
         f"Exported: {ts}",
         "",
-        "| Name | Remote | Branch | Commit | Install |",
-        "|------|--------|--------|--------|---------|",
+        "| Name | Origin | Revision | Target |",
+        "|------|--------|----------|--------|",
     ]
     for repo in sorted(catalog.repos, key=lambda r: r.name):
         short = repo.commit[:7] if len(repo.commit) >= 7 else repo.commit
-        install = repo.install or "-"
         remote_cell = repo.remote
         if repo.remote.count("/") == 1 and not repo.remote.startswith("local:"):
             remote_cell = f"[{repo.remote}](https://github.com/{repo.remote})"
         elif repo.remote.startswith("local:"):
             remote_cell = f"`{repo.remote.removeprefix('local:')}`"
         lines.append(
-            f"| {repo.name} | {remote_cell} "
-            f"| {repo.branch} | `{short}` | {install} |"
+            f"| {repo.name} | {remote_cell} | `{short}` | {repo.target} |"
         )
     lines.append("")
     return "\n".join(lines)
 
 
 def export_lock(catalog: Catalog, out: Path) -> None:
-    save_lock(out, lock_from_catalog(catalog))
-    md_path = out.parent / "VAND.md"
+    canonical = out.parent / LOCK_WRITE_FILENAME if out.name in LOCK_READ_FILENAMES else out
+    save_lock(canonical, lock_from_catalog(catalog))
+    md_path = canonical.parent / "VAND.md"
     md_path.write_text(render_vand_md(catalog), encoding="utf-8")
-    print(f"Wrote {out}")
+    print(f"Wrote {canonical}")
     print(f"Wrote {md_path}")
 
 
 @dataclass
-class RepoManifest:
+class SourceManifest:
+    version: int
     install: str | None = None
     update: str | None = None
     verify: str | None = None
-    source: str = ""
+    deinstall: str | None = None
+    source: SourceRef | None = None
+    target: str | None = None
+    source_file: str = ""
+
+
+RepoManifest = SourceManifest
 
 
 def commands_to_shell(value: Any) -> str | None:
@@ -1456,7 +1671,44 @@ def parse_simple_yaml(text: str) -> dict[str, Any]:
     return root
 
 
-def load_manifest_file(path: Path) -> RepoManifest | None:
+def parse_simple_ini(text: str) -> dict[str, Any]:
+    root: dict[str, Any] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].split(";", 1)[0].strip()
+        if not line or line.startswith("[") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        root[key.strip()] = value.strip().strip('"').strip("'")
+    return root
+
+
+def manifest_protocol_version(data: dict[str, Any]) -> int | None:
+    version = data.get("version")
+    if version is None:
+        return None
+    try:
+        return int(version)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_source_block(data: dict[str, Any]) -> SourceRef | None:
+    block = data.get("source")
+    if not isinstance(block, dict):
+        return None
+    origin = block.get("origin") or block.get("url")
+    if not origin:
+        return None
+    return SourceRef(
+        kind=str(block.get("kind") or "vcs"),
+        scheme=str(block.get("scheme") or "git"),
+        origin=str(origin),
+        revision=block.get("revision") or block.get("commit"),
+        digest=block.get("digest"),
+    )
+
+
+def load_manifest_file(path: Path) -> SourceManifest | None:
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -1466,34 +1718,41 @@ def load_manifest_file(path: Path) -> RepoManifest | None:
             data = json.loads(text)
         except json.JSONDecodeError:
             return None
+    elif path.suffix == ".ini":
+        data = parse_simple_ini(text)
     else:
         data = parse_simple_yaml(text)
     if not isinstance(data, dict):
         return None
+    version = manifest_protocol_version(data)
+    if version != MANIFEST_PROTOCOL_VERSION:
+        return None
     install = commands_to_shell(data.get("install"))
     update = commands_to_shell(data.get("update")) or install
     verify = commands_to_shell(data.get("verify"))
-    if not any((install, update, verify)):
+    deinstall = commands_to_shell(data.get("deinstall"))
+    if not any((install, update, verify, deinstall)):
         return None
-    return RepoManifest(
+    return SourceManifest(
+        version=version,
         install=install,
         update=update,
         verify=verify,
-        source=path.name,
+        deinstall=deinstall,
+        source=parse_source_block(data),
+        target=data.get("target"),
+        source_file=path.name,
     )
 
 
-def read_repo_manifest(repo_path: Path) -> RepoManifest | None:
-    for name in MANIFEST_FILENAMES:
-        manifest_path = repo_path / name
-        if manifest_path.is_file():
-            manifest = load_manifest_file(manifest_path)
-            if manifest:
-                return manifest
-    return None
+def read_repo_manifest(repo_path: Path) -> SourceManifest | None:
+    manifest_path = find_manifest_file(repo_path)
+    if manifest_path is None:
+        return None
+    return load_manifest_file(manifest_path)
 
 
-def detect_install_heuristic(repo_path: Path) -> RepoManifest | None:
+def detect_install_heuristic(repo_path: Path) -> SourceManifest | None:
     makefile = repo_path / "Makefile"
     if makefile.is_file():
         try:
@@ -1501,7 +1760,12 @@ def detect_install_heuristic(repo_path: Path) -> RepoManifest | None:
         except OSError:
             content = ""
         if re.search(r"^install\s*:", content, re.MULTILINE):
-            return RepoManifest(install="make install", update="make install", source="Makefile")
+            return SourceManifest(
+                version=MANIFEST_PROTOCOL_VERSION,
+                install="make install",
+                update="make install",
+                source_file="Makefile",
+            )
 
     package_json = repo_path / "package.json"
     if package_json.is_file():
@@ -1512,40 +1776,66 @@ def detect_install_heuristic(repo_path: Path) -> RepoManifest | None:
         scripts = data.get("scripts", {})
         if "install" in scripts:
             cmd = "npm ci" if (repo_path / "package-lock.json").exists() else "npm install"
-            return RepoManifest(install=cmd, update=cmd, source="package.json")
+            return SourceManifest(
+                version=MANIFEST_PROTOCOL_VERSION,
+                install=cmd,
+                update=cmd,
+                source_file="package.json",
+            )
         if "postinstall" in scripts:
             cmd = "npm run postinstall"
-            return RepoManifest(install=cmd, update=cmd, source="package.json")
+            return SourceManifest(
+                version=MANIFEST_PROTOCOL_VERSION,
+                install=cmd,
+                update=cmd,
+                source_file="package.json",
+            )
 
     pyproject = repo_path / "pyproject.toml"
     if pyproject.is_file() and (repo_path / "uv.lock").exists():
-        return RepoManifest(install="uv sync", update="uv sync", source="pyproject.toml")
+        return SourceManifest(
+            version=MANIFEST_PROTOCOL_VERSION,
+            install="uv sync",
+            update="uv sync",
+            source_file="pyproject.toml",
+        )
     if (repo_path / "requirements.txt").is_file():
-        return RepoManifest(
+        return SourceManifest(
+            version=MANIFEST_PROTOCOL_VERSION,
             install="python -m pip install -r requirements.txt",
             update="python -m pip install -r requirements.txt",
-            source="requirements.txt",
+            source_file="requirements.txt",
         )
 
     composer = repo_path / "composer.json"
     if composer.is_file():
-        return RepoManifest(install="composer install", update="composer install", source="composer.json")
+        return SourceManifest(
+            version=MANIFEST_PROTOCOL_VERSION,
+            install="composer install",
+            update="composer install",
+            source_file="composer.json",
+        )
 
     go_mod = repo_path / "go.mod"
     if go_mod.is_file():
-        return RepoManifest(install="go mod download", update="go mod download", source="go.mod")
+        return SourceManifest(
+            version=MANIFEST_PROTOCOL_VERSION,
+            install="go mod download",
+            update="go mod download",
+            source_file="go.mod",
+        )
 
     return None
 
 
-def discover_repo_hooks(repo_path: Path) -> RepoManifest | None:
+def discover_repo_hooks(repo_path: Path) -> SourceManifest | None:
     manifest = read_repo_manifest(repo_path)
     if manifest:
         return manifest
     return detect_install_heuristic(repo_path)
 
 
-def apply_manifest_to_entry(entry: RepoEntry, manifest: RepoManifest) -> None:
+def apply_manifest_to_entry(entry: SourceInstance, manifest: SourceManifest) -> None:
     if manifest.install:
         entry.install = manifest.install
     if manifest.update:
@@ -1553,7 +1843,7 @@ def apply_manifest_to_entry(entry: RepoEntry, manifest: RepoManifest) -> None:
 
 
 def resolve_hook_command(
-    entry: RepoEntry,
+    entry: SourceInstance,
     repo_path: Path,
     phase: str,
 ) -> tuple[str | None, str]:
@@ -1563,6 +1853,16 @@ def resolve_hook_command(
             return entry.update, "catalog"
         if entry.install:
             return entry.install, "catalog-install"
+    elif phase == "verify":
+        manifest = discover_repo_hooks(repo_path)
+        if manifest and manifest.verify:
+            return manifest.verify, manifest.source_file or "manifest"
+        return None, ""
+    elif phase == "deinstall":
+        manifest = discover_repo_hooks(repo_path)
+        if manifest and manifest.deinstall:
+            return manifest.deinstall, manifest.source_file or "manifest"
+        return None, ""
     elif entry.install:
         return entry.install, "catalog"
 
@@ -1573,16 +1873,16 @@ def resolve_hook_command(
         else:
             cmd = manifest.install
         if cmd:
-            return cmd, manifest.source or "manifest"
+            return cmd, manifest.source_file or "manifest"
 
     return None, ""
 
 
-def run_hook(entry: RepoEntry, path: Path, phase: str = "install") -> None:
+def run_hook(entry: SourceInstance, path: Path, phase: str = "install") -> None:
     command, origin = resolve_hook_command(entry, path, phase)
     if not command:
         return
-    label = "update" if phase == "update" else "install"
+    label = phase
     origin_note = f" ({origin})" if origin else ""
     print(f"  {label}: {entry.name}{origin_note}")
     result = subprocess.run(
@@ -1597,12 +1897,20 @@ def run_hook(entry: RepoEntry, path: Path, phase: str = "install") -> None:
         )
 
 
-def run_install(entry: RepoEntry, path: Path) -> None:
+def run_install(entry: SourceInstance, path: Path) -> None:
     run_hook(entry, path, phase="install")
 
 
-def run_update_hook(entry: RepoEntry, path: Path) -> None:
+def run_update_hook(entry: SourceInstance, path: Path) -> None:
     run_hook(entry, path, phase="update")
+
+
+def run_verify_hook(entry: SourceInstance, path: Path) -> None:
+    run_hook(entry, path, phase="verify")
+
+
+def run_deinstall_hook(entry: SourceInstance, path: Path) -> None:
+    run_hook(entry, path, phase="deinstall")
 
 
 def clone_repo(url: str, dest: Path, branch: str) -> None:
@@ -1667,7 +1975,7 @@ def list_conflicts(path: Path) -> list[str]:
 
 def consolidate_repo(
     catalog: Catalog,
-    entry: RepoEntry,
+    entry: SourceInstance,
     *,
     strategy: str,
     mode: str,
@@ -1821,9 +2129,9 @@ def cmd_init(args: argparse.Namespace) -> None:
             print(f"Log: {log_path}")
         catalog = load_catalog()
         data = load_lock(lock_path)
-        for raw in data.get("repos", []):
-            entry = RepoEntry.from_dict(raw)
-            dest = Path(catalog.root) / entry.path
+        for raw in lock_sources(data):
+            entry = SourceInstance.from_dict(raw)
+            dest = Path(catalog.root) / entry.target
             adopt_if_needed(catalog, dest, name=entry.name)
             catalog = load_catalog()
     elif args.lock:
@@ -1883,7 +2191,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
             if aliases:
                 extra = " (+" + ", ".join(remote_id_from_url(url) for url in aliases) + ")"
         manifest = discover_repo_hooks(path)
-        hook = f" [{manifest.source}]" if manifest else ""
+        hook = f" [{manifest.source_file}]" if manifest else ""
         print(f"  {rel}\t{slug}{extra}{hook}")
 
 
@@ -1906,13 +2214,11 @@ def cmd_add(args: argparse.Namespace) -> None:
     if not commit:
         raise SystemExit(f"Clone failed: {dest}")
 
-    entry = RepoEntry(
+    entry = SourceInstance(
         name=name,
-        remote=remote_id,
-        url=url,
-        path=path.replace("\\", "/"),
+        source=SourceRef.from_git_url(url, commit),
+        target=path.replace("\\", "/"),
         branch=branch,
-        commit=commit,
     )
     if args.install:
         entry.install = args.install
@@ -1920,11 +2226,11 @@ def cmd_add(args: argparse.Namespace) -> None:
         manifest = discover_repo_hooks(dest)
         if manifest:
             apply_manifest_to_entry(entry, manifest)
-            print(f"  hooks from {manifest.source}")
-    catalog.repos.append(entry)
-    save_catalog(catalog)
+            print(f"  hooks from {manifest.source_file}")
     if resolve_hook_command(entry, dest, "install")[0]:
         run_install(entry, dest)
+    catalog.repos.append(entry)
+    save_catalog(catalog)
     sync_pin_hooks(dest, entry.name)
     print(f"Added {name} @ {commit[:7]}")
 
@@ -1936,7 +2242,7 @@ def entry_from_clone(
     name: str | None = None,
     branch: str | None = None,
     install: str | None = None,
-) -> RepoEntry:
+) -> SourceInstance:
     path = path.resolve()
     root = Path(catalog.root).resolve()
     if not path.is_relative_to(root):
@@ -1958,13 +2264,11 @@ def entry_from_clone(
     mirrors = mirrors_from_clone(path, url, commit)
     rel = path.relative_to(root).as_posix()
     chosen = name or unique_name(catalog, path.name)
-    entry = RepoEntry(
+    entry = SourceInstance(
         name=chosen,
-        remote=remote_id,
-        url=url,
-        path=rel,
+        source=SourceRef.from_git_url(url, commit),
+        target=rel,
         branch=resolved_branch,
-        commit=commit,
         mirrors=mirrors,
     )
     if install:
@@ -1973,7 +2277,7 @@ def entry_from_clone(
         manifest = discover_repo_hooks(path)
         if manifest:
             apply_manifest_to_entry(entry, manifest)
-            print(f"  hooks from {manifest.source}")
+            print(f"  hooks from {manifest.source_file}")
     return entry
 
 
@@ -1982,7 +2286,7 @@ def adopt_if_needed(
     path: Path,
     *,
     name: str | None = None,
-) -> RepoEntry | None:
+) -> SourceInstance | None:
     path = Path(path).resolve()
     root = Path(catalog.root).resolve()
     if not path.exists():
@@ -2051,13 +2355,13 @@ def cmd_sync_hooks(args: argparse.Namespace) -> None:
         after = (entry.install, entry.update)
         if after != before:
             changed += 1
-            print(f"  synced {entry.name} from {manifest.source}")
+            print(f"  synced {entry.name} from {manifest.source_file}")
             if entry.install:
                 print(f"    install: {entry.install}")
             if entry.update and entry.update != entry.install:
                 print(f"    update:  {entry.update}")
         else:
-            print(f"  unchanged {entry.name} ({manifest.source})")
+            print(f"  unchanged {entry.name} ({manifest.source_file})")
     save_catalog(catalog)
     print(f"Synced {changed} repo(s)")
 
@@ -2105,7 +2409,7 @@ def cmd_pin(args: argparse.Namespace) -> None:
         pin_entry(catalog, entry, quiet=args.quiet)
         save_catalog(catalog)
         if args.export:
-            out = Path(catalog.root) / "vand.lock"
+            out = Path(catalog.root) / LOCK_WRITE_FILENAME
             export_lock(catalog, out)
         return
     repos = select_repos(catalog, args.name)
@@ -2113,8 +2417,36 @@ def cmd_pin(args: argparse.Namespace) -> None:
         pin_entry(catalog, entry, quiet=False)
     save_catalog(catalog)
     if args.export:
-        out = Path(catalog.root) / "vand.lock"
+        out = Path(catalog.root) / LOCK_WRITE_FILENAME
         export_lock(catalog, out)
+
+
+def cmd_deinstall(args: argparse.Namespace) -> None:
+    catalog = load_catalog()
+    entry = catalog.find(args.name)
+    if not entry:
+        raise SystemExit(f"Unknown repo: {args.name}")
+    path = repo_abs_path(catalog, entry)
+    log_lines: list[str] = []
+    if path.exists() and resolve_hook_command(entry, path, "deinstall")[0]:
+        run_deinstall_hook(entry, path)
+        log_lines.append(f"deinstall hook {entry.name}")
+    catalog.remove(args.name)
+    save_catalog(catalog)
+    if args.keep:
+        print(f"Removed {args.name} from catalog (folder kept)")
+        log_lines.append(f"catalog-only {args.name}")
+    else:
+        if path.exists():
+            shutil.rmtree(path)
+            print(f"Removed {args.name} from catalog and deleted {path}")
+            log_lines.append(f"purged {args.name}")
+        else:
+            print(f"Removed {args.name} from catalog (target already missing)")
+            log_lines.append(f"purged-missing {args.name}")
+    if log_lines:
+        log_path = write_log("deinstall", log_lines)
+        print(f"Log: {log_path}")
 
 
 def cmd_hook_sync(args: argparse.Namespace) -> None:
@@ -2231,7 +2563,7 @@ def cmd_push(args: argparse.Namespace) -> None:
 
 def cmd_export(args: argparse.Namespace) -> None:
     catalog = load_catalog()
-    out = Path(args.out) if args.out else Path(catalog.root) / "vand.lock"
+    out = Path(args.out) if args.out else Path(catalog.root) / LOCK_WRITE_FILENAME
     export_lock(catalog, out)
 
 
@@ -2244,33 +2576,31 @@ def replicate_lockfile(
 ) -> list[str]:
     data = load_lock(lock_path)
     log_lines: list[str] = []
-    for raw in data.get("repos", []):
-        entry = RepoEntry.from_dict(raw)
-        dest = root_path / entry.path
+    driver = GitDriver()
+    for raw in lock_sources(data):
+        entry = SourceInstance.from_dict(raw)
+        dest = root_path / entry.target
         print(f"-> {entry.name}")
 
         if dry_run:
             action = "clone+checkout" if not dest.exists() else "checkout"
             print(f"  [dry-run] would {action} @ {entry.commit[:7]}")
-            if entry.install:
-                print(f"  [dry-run] would run install: {entry.install}")
-            else:
-                cmd, origin = resolve_hook_command(entry, dest, "install")
-                if cmd:
-                    print(f"  [dry-run] would run install ({origin}): {cmd}")
+            cmd, origin = resolve_hook_command(entry, dest, "install")
+            if cmd:
+                print(f"  [dry-run] would run install ({origin}): {cmd}")
             continue
 
         cloned = False
         if not dest.exists():
-            clone_repo(entry.url, dest, entry.branch)
-            checkout_pin(dest, entry.commit, entry_fetch_urls(entry))
+            driver.acquire(entry.url, dest, entry.branch)
+            driver.materialize(dest, entry.commit, entry_fetch_urls(entry))
             cloned = True
             log_lines.append(f"cloned {entry.name}")
         elif update_existing:
             attach_entry_remotes(dest, entry)
             head = current_commit(dest)
             if head != entry.commit:
-                checkout_pin(dest, entry.commit, entry_fetch_urls(entry))
+                driver.materialize(dest, entry.commit, entry_fetch_urls(entry))
                 log_lines.append(f"checked out {entry.name} @ {entry.commit[:7]}")
             else:
                 print(f"  already at {entry.commit[:7]}")
@@ -2279,6 +2609,9 @@ def replicate_lockfile(
             print(f"  exists, leaving tree")
 
         if cloned or update_existing:
+            manifest = discover_repo_hooks(dest)
+            if manifest:
+                apply_manifest_to_entry(entry, manifest)
             if resolve_hook_command(entry, dest, "install")[0]:
                 run_install(entry, dest)
                 log_lines.append(f"installed {entry.name}")
@@ -2323,21 +2656,27 @@ def cmd_self_update(args: argparse.Namespace) -> None:
 
 def cmd_verify(args: argparse.Namespace) -> None:
     catalog = load_catalog()
-    lock_path = Path(args.lock) if args.lock else Path(catalog.root) / "vand.lock"
+    if args.lock:
+        lock_path = Path(args.lock)
+    else:
+        lock_path = find_lock_file(Path(catalog.root)) or (
+            Path(catalog.root) / LOCK_WRITE_FILENAME
+        )
     if lock_path.exists():
         data = load_lock(lock_path)
-        entries = [RepoEntry.from_dict(r) for r in data.get("repos", [])]
+        entries = instances_from_lock(data)
     else:
         entries = catalog.repos
     if args.root:
         root = Path(args.root).expanduser().resolve()
     else:
         root = Path(catalog.root)
-        entries = catalog.repos
+        if not args.lock:
+            entries = catalog.repos
 
     failed = 0
     for entry in entries:
-        path = root / entry.path
+        path = root / entry.target
         if not path.exists():
             print(f"FAIL {entry.name}: missing ({path})")
             failed += 1
@@ -2348,12 +2687,17 @@ def cmd_verify(args: argparse.Namespace) -> None:
             got = head[:7] if head else "?"
             print(f"FAIL {entry.name}: want {short}, got {got}")
             failed += 1
-        else:
-            print(f"OK   {entry.name} @ {entry.commit[:7]}")
+            continue
+        print(f"OK   {entry.name} @ {entry.commit[:7]}")
+        if resolve_hook_command(entry, path, "verify")[0]:
+            try:
+                run_verify_hook(entry, path)
+            except SystemExit:
+                failed += 1
 
     if failed:
         raise SystemExit(1)
-    print(f"All {len(entries)} repos match lock.")
+    print(f"All {len(entries)} sources match ledger.")
 
 
 def package_version() -> str:
@@ -2510,9 +2854,13 @@ def render_man(spec: dict[str, Any] | None = None) -> str:
             ".br",
             "Machine-local catalog (clone root, pins).",
             ".br",
-            "<clone-root>/vand.lock",
+            "<clone-root>/origins.lock",
             ".br",
-            "Shareable SHA pins (relative paths only).",
+            "Shareable provenance ledger (relative targets only).",
+            ".br",
+            "<repo>/source.yml",
+            ".br",
+            "Quotient manifest: install/update/verify/deinstall shell hooks.",
             ".SH EXIT STATUS",
             "0 on success. Non-zero on error, verify drift, or self-check behind/dirty/diverged.",
             ".SH SEE ALSO",
@@ -2589,7 +2937,7 @@ def cmd_man(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vand",
-        description="Track git repos, pin commits, export vand.lock, replicate stacks.",
+        description="Materialize and pin source instances; provenance ledger and quotient manifests.",
         epilog="Machine-readable: vand --help-json [COMMAND]. Man page: vand man.",
     )
     parser.add_argument(
@@ -2602,11 +2950,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print machine-readable CLI spec as JSON and exit",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser(
         "init",
-        help="First-run setup: catalog, pip -e this clone, skills, adopt self, replicate shared.lock",
+        help="First-run setup: catalog, pip -e this clone, skills, adopt self, replicate origins.lock",
     )
     p.add_argument(
         "--root",
@@ -2616,7 +2969,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="Overwrite existing catalog")
     p.add_argument(
         "--lock",
-        help="Replicate this lock after init (default: examples/shared.lock if present)",
+        help="Replicate this ledger after init (default: examples/origins.lock if present)",
     )
     p.add_argument("--no-lock", action="store_true", help="Skip stack lock replicate")
     p.add_argument(
@@ -2639,7 +2992,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--branch", default="main", help="Branch to clone (default: main)")
     p.add_argument(
         "--install",
-        help="Override install hook (default: read vand.yml from repo)",
+        help="Override install hook (default: read source.yml from repo)",
     )
     p.set_defaults(func=cmd_add)
 
@@ -2649,20 +3002,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--branch", help="Override branch")
     p.add_argument(
         "--install",
-        help="Override install hook (default: read vand.yml from repo)",
+        help="Override install hook (default: read source.yml from repo)",
     )
     p.set_defaults(func=cmd_adopt)
 
     p = sub.add_parser(
         "sync-hooks",
-        help="Refresh catalog install/update commands from each repo's vand.yml manifest",
+        help="Refresh catalog install/update commands from each repo's source.yml manifest",
     )
     p.add_argument("name", nargs="?", help="Single repo")
     p.set_defaults(func=cmd_sync_hooks)
 
-    p = sub.add_parser("rm", help="Remove from catalog (keeps folder)")
+    p = sub.add_parser("rm", help="Remove from catalog (keeps folder; see deinstall --keep)")
     p.add_argument("name", help="Catalog name")
     p.set_defaults(func=cmd_rm)
+
+    p = sub.add_parser(
+        "deinstall",
+        help="Remove from catalog and purge target directory (default)",
+    )
+    p.add_argument("name", help="Catalog name")
+    p.add_argument(
+        "--keep",
+        action="store_true",
+        help="Keep target directory on disk (same as rm)",
+    )
+    p.set_defaults(func=cmd_deinstall)
 
     p = sub.add_parser("status", help="Show pin status")
     p.add_argument("name", nargs="?", help="Single repo")
@@ -2681,7 +3046,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="No stdout; failures log to ~/.vand/logs/hook-pin.log",
     )
-    p.add_argument("--export", action="store_true", help="Also write vand.lock")
+    p.add_argument("--export", action="store_true", help="Also write origins.lock")
     p.set_defaults(func=cmd_pin)
 
     p = sub.add_parser(
@@ -2731,12 +3096,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", nargs="?", help="Single repo")
     p.set_defaults(func=cmd_push)
 
-    p = sub.add_parser("export", help="Write vand.lock and VAND.md")
-    p.add_argument("--out", help="Lock file path (default: <root>/vand.lock)")
+    p = sub.add_parser("export", help="Write origins.lock and VAND.md")
+    p.add_argument("--out", help="Ledger file path (default: <root>/origins.lock)")
     p.set_defaults(func=cmd_export)
 
-    p = sub.add_parser("replicate", help="Bootstrap stack from vand.lock")
-    p.add_argument("lockfile", help="Path to vand.lock")
+    p = sub.add_parser("replicate", help="Bootstrap stack from origins.lock")
+    p.add_argument("lockfile", help="Path to origins.lock (or read alias)")
     p.add_argument(
         "--root",
         help="Clone root on this machine (default: directory that contains the lockfile)",
@@ -2744,8 +3109,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="Print actions without cloning")
     p.set_defaults(func=cmd_replicate)
 
-    p = sub.add_parser("verify", help="Check clones match lock (exit 1 on drift)")
-    p.add_argument("--lock", help="Lock file (default: <root>/vand.lock)")
+    p = sub.add_parser("verify", help="Check clones match ledger; run verify hooks")
+    p.add_argument("--lock", help="Ledger file (default: <root>/origins.lock)")
     p.add_argument("--root", help="Override root")
     p.set_defaults(func=cmd_verify)
 

@@ -68,16 +68,16 @@ class LockRoundTripTests(unittest.TestCase):
         lock = gu.lock_from_catalog(catalog)
         self.assertEqual(lock["version"], 1)
         self.assertNotIn("root", lock)
-        self.assertEqual(len(lock["repos"]), 1)
-        self.assertEqual(lock["repos"][0]["github"], "acme/demo")
-        entry = gu.RepoEntry.from_dict(lock["repos"][0])
+        self.assertEqual(len(lock["sources"]), 1)
+        self.assertNotIn("install", lock["sources"][0])
+        self.assertNotIn("hooks", lock["sources"][0])
+        entry = gu.SourceInstance.from_dict(lock["sources"][0])
         self.assertEqual(entry.name, "demo")
         self.assertEqual(entry.remote, "acme/demo")
         self.assertEqual(entry.commit, "abc123def456")
-        self.assertEqual(entry.install, "echo hi")
-        self.assertEqual(entry.mirrors, [])
+        self.assertEqual(entry.target, "demo")
 
-    def test_mirrors_roundtrip(self) -> None:
+    def test_mirrors_not_in_lock_export(self) -> None:
         catalog = gu.Catalog(
             version=1,
             root="/repos",
@@ -94,14 +94,11 @@ class LockRoundTripTests(unittest.TestCase):
             ],
         )
         lock = gu.lock_from_catalog(catalog)
-        self.assertEqual(
-            lock["repos"][0]["mirrors"],
-            ["https://github.com/acme/demo.git"],
-        )
-        entry = gu.RepoEntry.from_dict(lock["repos"][0])
-        self.assertEqual(entry.mirrors, ["https://github.com/acme/demo.git"])
+        self.assertNotIn("mirrors", lock["sources"][0])
+        entry = gu.SourceInstance.from_dict(lock["sources"][0])
+        self.assertEqual(entry.mirrors, [])
 
-    def test_mirrors_round_trip(self) -> None:
+    def test_mirrors_round_trip_catalog(self) -> None:
         entry = gu.RepoEntry(
             name="agent-memory",
             remote="Klix927/agent-memory",
@@ -111,7 +108,7 @@ class LockRoundTripTests(unittest.TestCase):
             commit="abc",
             mirrors=["https://github.com/Lolaplex/agent-memory.git"],
         )
-        loaded = gu.RepoEntry.from_dict(entry.to_dict())
+        loaded = gu.SourceInstance.from_dict(entry.to_dict())
         self.assertEqual(
             loaded.mirrors,
             ["https://github.com/Lolaplex/agent-memory.git"],
@@ -119,7 +116,7 @@ class LockRoundTripTests(unittest.TestCase):
 
     def test_resolve_lock_root_ignores_foreign_absolute(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            lock_path = Path(tmp) / "vand.lock"
+            lock_path = Path(tmp) / "origins.lock"
             lock_path.write_text("{}", encoding="utf-8")
             foreign = "C:/definitely/not/on/this/machine/repos"
             data = {"version": 1, "root": foreign}
@@ -133,25 +130,50 @@ class LockRoundTripTests(unittest.TestCase):
 
     def test_save_and_load_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "vand.lock"
+            path = Path(tmp) / "origins.lock"
             data = {
                 "version": 1,
-                "root": str(Path(tmp).as_posix()),
-                "repos": [
+                "sources": [
                     {
                         "name": "x",
-                        "github": "o/x",
-                        "url": "https://github.com/o/x.git",
-                        "path": "x",
-                        "branch": "main",
-                        "commit": "deadbeef" * 5,
+                        "source": {
+                            "kind": "vcs",
+                            "scheme": "git",
+                            "origin": "https://github.com/o/x.git",
+                            "revision": "deadbeef" * 5,
+                        },
+                        "target": "x",
                     }
                 ],
             }
             gu.save_lock(path, data)
             loaded = gu.load_lock(path)
-            entry = gu.RepoEntry.from_dict(loaded["repos"][0])
+            entry = gu.SourceInstance.from_dict(loaded["sources"][0])
             self.assertEqual(entry.remote, "o/x")
+
+    def test_export_writes_canonical_origins_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog = gu.Catalog(
+                version=1,
+                root=str(root),
+                repos=[
+                    gu.RepoEntry(
+                        name="app",
+                        remote="me/app",
+                        url="https://github.com/me/app.git",
+                        path="app",
+                        branch="main",
+                        commit="a" * 40,
+                    )
+                ],
+            )
+            with mock.patch("builtins.print"):
+                gu.export_lock(catalog, root / "vand.lock")
+            self.assertTrue((root / "origins.lock").is_file())
+            payload = json.loads((root / "origins.lock").read_text(encoding="utf-8"))
+            self.assertEqual(payload["version"], 1)
+            self.assertEqual(payload["sources"][0]["target"], "app")
 
 
 class StatusClassificationTests(unittest.TestCase):
@@ -197,20 +219,21 @@ class StatusClassificationTests(unittest.TestCase):
 class ReplicateDryRunTests(unittest.TestCase):
     def test_dry_run_does_not_clone(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            lock = Path(tmp) / "vand.lock"
+            lock = Path(tmp) / "origins.lock"
             lock.write_text(
                 json.dumps(
                     {
                         "version": 1,
-                        "root": tmp.replace("\\", "/"),
-                        "repos": [
+                        "sources": [
                             {
                                 "name": "new-repo",
-                                "github": "o/new",
-                                "url": "https://github.com/o/new.git",
-                                "path": "new-repo",
-                                "branch": "main",
-                                "commit": "b" * 40,
+                                "source": {
+                                    "kind": "vcs",
+                                    "scheme": "git",
+                                    "origin": "https://github.com/o/new.git",
+                                    "revision": "b" * 40,
+                                },
+                                "target": "new-repo",
                             }
                         ],
                     }
@@ -281,14 +304,66 @@ class ManifestTests(unittest.TestCase):
 
     def test_load_manifest_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "vand.json"
+            path = Path(tmp) / "source.json"
             path.write_text(
-                json.dumps({"install": "make setup", "update": "make setup"}),
+                json.dumps(
+                    {
+                        "version": 1,
+                        "install": "make setup",
+                        "update": "make setup",
+                    }
+                ),
                 encoding="utf-8",
             )
             manifest = gu.load_manifest_file(path)
             assert manifest is not None
+            self.assertEqual(manifest.version, 1)
             self.assertEqual(manifest.install, "make setup")
+
+    def test_manifest_requires_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "source.json"
+            path.write_text(
+                json.dumps({"install": "make setup", "update": "make setup"}),
+                encoding="utf-8",
+            )
+            self.assertIsNone(gu.load_manifest_file(path))
+
+    def test_read_alias_vand_yml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "vand.yml").write_text(
+                "version: 1\ninstall: from-alias\nupdate: from-alias\n",
+                encoding="utf-8",
+            )
+            manifest = gu.read_repo_manifest(root)
+            assert manifest is not None
+            self.assertEqual(manifest.install, "from-alias")
+            self.assertEqual(manifest.source_file, "vand.yml")
+
+    def test_read_alias_vend_ini(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "vend.ini").write_text(
+                "version=1\ninstall=from-ini\nupdate=from-ini\n",
+                encoding="utf-8",
+            )
+            manifest = gu.read_repo_manifest(root)
+            assert manifest is not None
+            self.assertEqual(manifest.install, "from-ini")
+
+    def test_quotient_deinstall(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "source.yml"
+            path.write_text(
+                "version: 1\ninstall: echo install\nupdate: echo update\n"
+                "verify: echo verify\ndeinstall: echo bye\n",
+                encoding="utf-8",
+            )
+            manifest = gu.load_manifest_file(path)
+            assert manifest is not None
+            self.assertEqual(manifest.deinstall, "echo bye")
+            self.assertEqual(manifest.verify, "echo verify")
 
     def test_makefile_heuristic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -301,7 +376,10 @@ class ManifestTests(unittest.TestCase):
     def test_resolve_prefers_catalog_over_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "vand.yml").write_text("install: from-manifest\n", encoding="utf-8")
+            (root / "source.yml").write_text(
+                "version: 1\ninstall: from-manifest\nupdate: from-manifest\n",
+                encoding="utf-8",
+            )
             entry = gu.RepoEntry(
                 name="t",
                 remote="o/t",
@@ -345,6 +423,7 @@ class VendorMdTests(unittest.TestCase):
         self.assertIn("me/app", md)
         self.assertNotIn("/repos", md)
         self.assertIn("replicate --root", md)
+        self.assertNotIn("Install", md)
 
 
 class SelfCheckTests(unittest.TestCase):
@@ -729,6 +808,7 @@ class HelpSpecTests(unittest.TestCase):
         self.assertIn("man", names)
         self.assertIn("install-skills", names)
         self.assertIn("hook-sync", names)
+        self.assertIn("deinstall", names)
         self.assertIn("pin", names)
         flags = {f for opt in spec["options"] for f in opt.get("flags", [])}
         self.assertIn("--help-json", flags)
@@ -884,7 +964,7 @@ class InitBootstrapTests(unittest.TestCase):
             skills.assert_called_once()
             data = json.loads(catalog_path.read_text(encoding="utf-8"))
             self.assertEqual(Path(data["root"]).resolve(), root.resolve())
-            self.assertEqual(data["repos"], [])
+            self.assertEqual(data.get("sources", data.get("repos", [])), [])
 
     def test_cli_init_flags(self) -> None:
         spec = gu.cli_spec()
@@ -893,6 +973,150 @@ class InitBootstrapTests(unittest.TestCase):
         self.assertIn("--no-lock", flags)
         self.assertIn("--no-pip", flags)
         self.assertIn("--lock", flags)
+
+
+class DeinstallTests(unittest.TestCase):
+    def test_deinstall_purges_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "repos"
+            root.mkdir()
+            target = root / "demo"
+            target.mkdir()
+            (target / "marker.txt").write_text("x", encoding="utf-8")
+            catalog = gu.Catalog(
+                version=1,
+                root=str(root),
+                repos=[
+                    gu.RepoEntry(
+                        name="demo",
+                        remote="o/demo",
+                        url="https://github.com/o/demo.git",
+                        path="demo",
+                        branch="main",
+                        commit="a" * 40,
+                    )
+                ],
+            )
+            catalog_path = home / "catalog.json"
+            with mock.patch.object(gu, "CATALOG_PATH", catalog_path):
+                gu.save_catalog(catalog)
+                with mock.patch("builtins.print"):
+                    gu.cmd_deinstall(argparse_namespace(name="demo", keep=False))
+                self.assertFalse(target.exists())
+                loaded = gu.load_catalog()
+                self.assertIsNone(loaded.find("demo"))
+
+    def test_deinstall_runs_hook_before_purge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "repos"
+            root.mkdir()
+            target = root / "demo"
+            target.mkdir()
+            (target / "source.yml").write_text(
+                "version: 1\ninstall: echo i\nupdate: echo u\ndeinstall: echo bye\n",
+                encoding="utf-8",
+            )
+            catalog = gu.Catalog(
+                version=1,
+                root=str(root),
+                repos=[
+                    gu.RepoEntry(
+                        name="demo",
+                        remote="o/demo",
+                        url="https://github.com/o/demo.git",
+                        path="demo",
+                        branch="main",
+                        commit="a" * 40,
+                    )
+                ],
+            )
+            catalog_path = home / "catalog.json"
+            with mock.patch.object(gu, "CATALOG_PATH", catalog_path):
+                gu.save_catalog(catalog)
+                with mock.patch("vand.run_deinstall_hook") as hook:
+                    with mock.patch("builtins.print"):
+                        gu.cmd_deinstall(argparse_namespace(name="demo", keep=False))
+                hook.assert_called_once()
+
+    def test_deinstall_keep_leaves_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "repos"
+            root.mkdir()
+            target = root / "demo"
+            target.mkdir()
+            catalog = gu.Catalog(
+                version=1,
+                root=str(root),
+                repos=[
+                    gu.RepoEntry(
+                        name="demo",
+                        remote="o/demo",
+                        url="https://github.com/o/demo.git",
+                        path="demo",
+                        branch="main",
+                        commit="a" * 40,
+                    )
+                ],
+            )
+            catalog_path = home / "catalog.json"
+            with mock.patch.object(gu, "CATALOG_PATH", catalog_path):
+                gu.save_catalog(catalog)
+                with mock.patch("builtins.print"):
+                    gu.cmd_deinstall(argparse_namespace(name="demo", keep=True))
+                self.assertTrue(target.exists())
+
+
+class FailedInstallLedgerTests(unittest.TestCase):
+    @mock.patch("vand.sync_pin_hooks")
+    @mock.patch("vand.run_install", side_effect=SystemExit("install failed"))
+    @mock.patch("vand.current_commit", return_value="c" * 40)
+    @mock.patch("vand.clone_repo")
+    def test_failed_add_does_not_save_catalog(
+        self,
+        _clone: mock.Mock,
+        _head: mock.Mock,
+        _install: mock.Mock,
+        _hooks: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "repos"
+            root.mkdir()
+            catalog_path = home / "catalog.json"
+            with mock.patch.object(gu, "CATALOG_PATH", catalog_path):
+                with mock.patch.object(gu, "CONFIG_DIR", home):
+                    gu.save_catalog(gu.Catalog(version=1, root=str(root), repos=[]))
+                    with self.assertRaises(SystemExit):
+                        gu.cmd_add(
+                            argparse_namespace(
+                                repo="acme/demo",
+                                name=None,
+                                path=None,
+                                branch="main",
+                                install="echo fail",
+                            )
+                        )
+                    loaded = json.loads(catalog_path.read_text(encoding="utf-8"))
+                    self.assertEqual(loaded.get("sources", loaded.get("repos", [])), [])
+
+    def test_load_lock_rejects_unsupported_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vand.lock"
+            path.write_text(json.dumps({"version": 99, "repos": []}), encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                gu.load_lock(path)
+
+
+class GitDriverTests(unittest.TestCase):
+    @mock.patch("vand.run_git")
+    @mock.patch("vand.current_commit", return_value="a" * 40)
+    def test_verify_matches_revision(self, _head: mock.Mock, _git: mock.Mock) -> None:
+        driver = gu.GitDriver()
+        self.assertTrue(driver.verify(Path("/tmp/r"), "a" * 40))
+        self.assertFalse(driver.verify(Path("/tmp/r"), "b" * 40))
 
 
 if __name__ == "__main__":
