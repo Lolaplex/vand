@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Lock vs log separation documented: `origins.lock` records completed source facts; execution attempts live in `~/.vand/logs/`.
 - `src/` package layout with console script entry point (`pip install -e .` puts `vand` on PATH).
 
-## [Unreleased]
+## [1.0.1] - 2026-08-24
 
 ### Fixed
 
@@ -34,5 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Most commands accept multiple repos inline in order (e.g. `vand update agents-docs agents-memory vand`); with no names they apply to the whole catalog.
 - `consolidate --rebase` refuses when it would rewrite local history across more than one upstream commit; plain merge is suggested instead, and completed rebases are logged explicitly with old/new SHAs.
 
-[Unreleased]: https://github.com/Lolaplex/vand/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/Lolaplex/vand/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/Lolaplex/vand/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/Lolaplex/vand/releases/tag/v1.0.0
