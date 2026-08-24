@@ -292,6 +292,40 @@ class ConsolidateTests(unittest.TestCase):
                 )
         self.assertEqual(outcome, "conflict")
 
+    @mock.patch("vand.run_install")
+    @mock.patch("vand.attach_entry_remotes")
+    @mock.patch("vand.fetch_all_remotes")
+    @mock.patch("vand.pin_fetch_remote_names", return_value=["origin"])
+    @mock.patch("vand.remote_ahead_behind", return_value=(1, 3))
+    @mock.patch("vand.pick_sync_ref", return_value=(None, "diverged"))
+    @mock.patch("vand.is_dirty", return_value=False)
+    @mock.patch("vand.current_branch", return_value="main")
+    @mock.patch("vand.current_commit", return_value="c" * 40)
+    @mock.patch("vand.merge_in_progress", return_value=False)
+    @mock.patch("vand.rebase_in_progress", return_value=False)
+    @mock.patch("vand.repo_abs_path")
+    def test_rebase_refused_when_history_would_rewrite(
+        self,
+        mock_path: mock.Mock,
+        *_m: mock.Mock,
+    ) -> None:
+        catalog = gu.Catalog(version=1, root="/tmp", repos=[])
+        entry = gu.RepoEntry(
+            name="t",
+            remote="o/t",
+            url="https://github.com/o/t.git",
+            path="t",
+            branch="main",
+            commit="a" * 40,
+        )
+        mock_path.return_value = Path("/tmp/t")
+        with mock.patch("pathlib.Path.exists", return_value=True):
+            outcome, logs = gu.consolidate_repo(
+                catalog, entry, strategy="rebase", mode="default"
+            )
+        self.assertEqual(outcome, "skipped")
+        self.assertTrue(any("rebase-refused" in line for line in logs))
+
 
 class ManifestTests(unittest.TestCase):
     def test_parse_simple_yaml_list(self) -> None:
@@ -925,7 +959,7 @@ class PinHookTests(unittest.TestCase):
         mock_lookup.return_value = None
         with mock.patch("vand.load_catalog", return_value=gu.Catalog(version=1, root="/tmp", repos=[])):
             with mock.patch("vand.log_hook_pin") as log:
-                gu.cmd_pin(argparse_namespace(here=True, quiet=True, name=None, export=False))
+                gu.cmd_pin(argparse_namespace(here=True, quiet=True, names=[], export=False))
         log.assert_called_once()
         mock_pin.assert_not_called()
 
@@ -1117,6 +1151,76 @@ class GitDriverTests(unittest.TestCase):
         driver = gu.GitDriver()
         self.assertTrue(driver.verify(Path("/tmp/r"), "a" * 40))
         self.assertFalse(driver.verify(Path("/tmp/r"), "b" * 40))
+
+
+class SelectReposManyTests(unittest.TestCase):
+    def _catalog(self) -> gu.Catalog:
+        return gu.Catalog(
+            version=1,
+            root="/tmp",
+            repos=[
+                gu.RepoEntry(
+                    name="alpha",
+                    remote="o/alpha",
+                    url="https://github.com/o/alpha.git",
+                    path="alpha",
+                    branch="main",
+                    commit="a" * 40,
+                ),
+                gu.RepoEntry(
+                    name="beta",
+                    remote="o/beta",
+                    url="https://github.com/o/beta.git",
+                    path="beta",
+                    branch="main",
+                    commit="b" * 40,
+                ),
+            ],
+        )
+
+    def test_multiple_names_preserve_order(self) -> None:
+        catalog = self._catalog()
+        entries = gu.select_repos_many(catalog, ["beta", "alpha"])
+        self.assertEqual([e.name for e in entries], ["beta", "alpha"])
+
+    def test_unknown_name_lists_all_missing(self) -> None:
+        with self.assertRaises(SystemExit) as ctx:
+            gu.select_repos_many(self._catalog(), ["alpha", "ghost"])
+        self.assertIn("ghost", str(ctx.exception))
+
+
+class DivergedPushTests(unittest.TestCase):
+    @mock.patch("vand.write_log")
+    @mock.patch("vand.save_catalog")
+    @mock.patch("vand.remote_ahead_behind", return_value=(2, 3))
+    @mock.patch("vand.pin_fetch_remote_names", return_value=["origin"])
+    @mock.patch("vand.fetch_all_remotes")
+    @mock.patch("vand.attach_entry_remotes")
+    @mock.patch("vand.current_branch", return_value="main")
+    @mock.patch("vand.is_dirty", return_value=False)
+    @mock.patch("vand.run_git")
+    @mock.patch("vand.repo_abs_path")
+    def test_push_refused_when_diverged(
+        self,
+        mock_path: mock.Mock,
+        *_m: mock.Mock,
+    ) -> None:
+        mock_path.return_value = Path("/tmp/r")
+        entry = gu.RepoEntry(
+            name="t",
+            remote="o/t",
+            url="https://github.com/o/t.git",
+            path="t",
+            branch="main",
+            commit="a" * 40,
+        )
+        catalog = gu.Catalog(version=1, root="/tmp", repos=[entry])
+        with mock.patch.object(gu, "load_catalog", return_value=catalog):
+            gu.cmd_push(argparse_namespace(names=["t"], no_self_check=True))
+        push_calls = [
+            c for c in gu.run_git.call_args_list if c.args[1:2] == ("push",)
+        ]
+        self.assertEqual(push_calls, [])
 
 
 if __name__ == "__main__":

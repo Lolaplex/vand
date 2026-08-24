@@ -834,6 +834,19 @@ def maybe_apply_self_update() -> None:
         apply_self_update(interactive=False, observed=result)
 
 
+def format_process_error(exc: subprocess.CalledProcessError) -> str:
+    """Human-readable one-block error for a failed git/shell subprocess."""
+    cmd = " ".join(str(part) for part in exc.cmd) if exc.cmd else "git"
+    message = f"Command failed (exit {exc.returncode}): {cmd}"
+    stderr = exc.stderr.strip() if isinstance(exc.stderr, str) and exc.stderr else ""
+    if stderr:
+        return f"{message}\n{stderr}"
+    stdout = exc.stdout.strip() if isinstance(exc.stdout, str) and exc.stdout else ""
+    if stdout:
+        return f"{message}\n{stdout}"
+    return message
+
+
 def run_git(
     repo_path: Path | None,
     *args: str,
@@ -1178,7 +1191,7 @@ def is_self_checkout(catalog: Catalog, entry: SourceInstance) -> bool:
 
 def should_defer_self(args: argparse.Namespace, catalog: Catalog, entry: SourceInstance) -> bool:
     """Skip catalog vand during bulk update; self-update runs after."""
-    if getattr(args, "name", None):
+    if getattr(args, "names", None):
         return False
     if getattr(args, "no_self_check", False):
         return False
@@ -1346,13 +1359,21 @@ def classify_repo(catalog: Catalog, entry: SourceInstance, fetch: bool = False) 
     return "pinned"
 
 
-def select_repos(catalog: Catalog, name: str | None) -> list[SourceInstance]:
-    if name:
+def select_repos_many(catalog: Catalog, names: list[str] | None) -> list[SourceInstance]:
+    """Resolve one or more repo names (or None = all) in the given order."""
+    if not names:
+        return list(catalog.repos)
+    entries: list[SourceInstance] = []
+    missing = []
+    for name in names:
         entry = catalog.find(name)
-        if not entry:
-            raise SystemExit(f"Unknown repo: {name}")
-        return [entry]
-    return list(catalog.repos)
+        if entry:
+            entries.append(entry)
+        else:
+            missing.append(name)
+    if missing:
+        raise SystemExit(f"Unknown repo(s): {', '.join(missing)}")
+    return entries
 
 
 def catalog_entry_for_path(catalog: Catalog, path: Path) -> SourceInstance | None:
@@ -1921,11 +1942,23 @@ def clone_repo(url: str, dest: Path, branch: str) -> None:
     print(f"  clone: {clone_url} -> {dest}")
     try:
         run_git(None, "clone", "--branch", branch, clone_url, str(dest))
-    except subprocess.CalledProcessError:
-        if is_local_remote(clone_url):
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() if isinstance(exc.stderr, str) else ""
+        low = detail.lower()
+        branch_missing = "not found in upstream origin" in low or (
+            "remote branch" in low
+        )
+        if is_local_remote(clone_url) or branch_missing:
             run_git(None, "clone", clone_url, str(dest))
-        else:
-            raise
+            return
+        hint = ""
+        if "repository" in low or "repo not found" in low:
+            hint = " Check the owner/repo spelling and your access."
+        elif "could not read from remote" in low or "unable to access" in low:
+            hint = " Remote unreachable - check network or URL."
+        raise SystemExit(
+            f"{format_process_error(exc)}\nCould not clone {clone_url}.{hint}"
+        ) from None
 
 
 def checkout_pin(
@@ -2046,6 +2079,17 @@ def consolidate_repo(
             entry.commit = head
         if sync == "diverged":
             print(f"  diverged - trying {strategy} onto {merge_ref}")
+            sync_remote = (
+                "origin" if "origin" in names else (names[0] if names else "origin")
+            )
+            ahead, behind = remote_ahead_behind(path, branch, sync_remote)
+            if strategy == "rebase" and behind > 1:
+                print(
+                    f"  refusing rebase onto {merge_ref}: local history would be "
+                    f"rewritten across {behind} upstream commit(s). "
+                    f"Use plain merge: vand consolidate {entry.name}"
+                )
+                return "skipped", [f"rebase-refused {entry.name}"]
         else:
             print(f"  up to date")
             return "ok", []
@@ -2067,7 +2111,12 @@ def consolidate_repo(
 
     try:
         if strategy == "rebase":
+            before = current_commit(path)
             run_git(path, "rebase", merge_ref)
+            after = current_commit(path)
+            if after and after != before:
+                print(f"  rebased {before[:7]} -> {after[:7]} (local commits rewritten)")
+                logs.append(f"rebased {entry.name} {before[:7]}->{after[:7]}")
         else:
             run_git(path, "merge", merge_ref)
     except subprocess.CalledProcessError:
@@ -2140,7 +2189,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 def cmd_consolidate(args: argparse.Namespace) -> None:
     catalog = load_catalog()
-    repos = select_repos(catalog, args.name)
+    repos = select_repos_many(catalog, args.names)
     mode = "default"
     if args.continue_:
         mode = "continue"
@@ -2339,7 +2388,7 @@ def cmd_adopt(args: argparse.Namespace) -> None:
 
 def cmd_sync_hooks(args: argparse.Namespace) -> None:
     catalog = load_catalog()
-    repos = select_repos(catalog, args.name)
+    repos = select_repos_many(catalog, args.names)
     changed = 0
     for entry in repos:
         path = repo_abs_path(catalog, entry)
@@ -2385,7 +2434,7 @@ def print_status_table(rows: list[tuple[str, str, str, str]]) -> None:
 
 def cmd_status(args: argparse.Namespace) -> None:
     catalog = load_catalog()
-    repos = select_repos(catalog, args.name)
+    repos = select_repos_many(catalog, args.names)
     rows: list[tuple[str, str, str, str]] = []
     for entry in repos:
         status = classify_repo(catalog, entry, fetch=args.fetch)
@@ -2397,7 +2446,7 @@ def cmd_status(args: argparse.Namespace) -> None:
 def cmd_pin(args: argparse.Namespace) -> None:
     catalog = load_catalog()
     if args.here:
-        if args.name:
+        if args.names:
             raise SystemExit("Use either NAME or --here, not both")
         entry = catalog_entry_for_path(catalog, Path.cwd())
         if not entry:
@@ -2412,7 +2461,7 @@ def cmd_pin(args: argparse.Namespace) -> None:
             out = Path(catalog.root) / LOCK_WRITE_FILENAME
             export_lock(catalog, out)
         return
-    repos = select_repos(catalog, args.name)
+    repos = select_repos_many(catalog, args.names)
     for entry in repos:
         pin_entry(catalog, entry, quiet=False)
     save_catalog(catalog)
@@ -2451,7 +2500,7 @@ def cmd_deinstall(args: argparse.Namespace) -> None:
 
 def cmd_hook_sync(args: argparse.Namespace) -> None:
     catalog = load_catalog()
-    repos = select_repos(catalog, args.name)
+    repos = select_repos_many(catalog, args.names)
     for entry in repos:
         path = repo_abs_path(catalog, entry)
         if not path.exists():
@@ -2462,7 +2511,7 @@ def cmd_hook_sync(args: argparse.Namespace) -> None:
 
 def cmd_install(args: argparse.Namespace) -> None:
     catalog = load_catalog()
-    repos = select_repos(catalog, args.name)
+    repos = select_repos_many(catalog, args.names)
     log_lines: list[str] = []
     for entry in repos:
         path = repo_abs_path(catalog, entry)
@@ -2486,7 +2535,7 @@ def cmd_install(args: argparse.Namespace) -> None:
 
 def cmd_update(args: argparse.Namespace) -> None:
     catalog = load_catalog()
-    repos = select_repos(catalog, args.name)
+    repos = select_repos_many(catalog, args.names)
     log_lines: list[str] = []
     for entry in repos:
         path = repo_abs_path(catalog, entry)
@@ -2536,7 +2585,7 @@ def cmd_update(args: argparse.Namespace) -> None:
 
 def cmd_push(args: argparse.Namespace) -> None:
     catalog = load_catalog()
-    repos = select_repos(catalog, args.name)
+    repos = select_repos_many(catalog, args.names)
     log_lines: list[str] = []
     for entry in repos:
         path = repo_abs_path(catalog, entry)
@@ -2548,6 +2597,19 @@ def cmd_push(args: argparse.Namespace) -> None:
             print(f"  skipped (dirty working tree)")
             continue
         branch = current_branch(path) or entry.branch
+        attach_entry_remotes(path, entry)
+        fetch_all_remotes(path, entry_fetch_urls(entry))
+        names = pin_fetch_remote_names(path, entry)
+        remote = "origin" if "origin" in names else (names[0] if names else "origin")
+        ahead, behind = remote_ahead_behind(path, branch, remote)
+        if ahead and behind:
+            print(
+                f"  refused: diverged from {remote}/{branch} "
+                f"(ahead {ahead}, behind {behind}) - not pushing. "
+                f"Reconcile first: vand consolidate {entry.name}"
+            )
+            log_lines.append(f"push-refused diverged {entry.name}")
+            continue
         run_git(path, "push", "origin", branch)
         head = current_commit(path)
         if head:
@@ -3010,7 +3072,7 @@ def build_parser() -> argparse.ArgumentParser:
         "sync-hooks",
         help="Refresh catalog install/update commands from each repo's source.yml manifest",
     )
-    p.add_argument("name", nargs="?", help="Single repo")
+    p.add_argument("names", nargs="*", metavar="NAME", help="One or more repos (default: all)")
     p.set_defaults(func=cmd_sync_hooks)
 
     p = sub.add_parser("rm", help="Remove from catalog (keeps folder; see deinstall --keep)")
@@ -3030,12 +3092,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_deinstall)
 
     p = sub.add_parser("status", help="Show pin status")
-    p.add_argument("name", nargs="?", help="Single repo")
+    p.add_argument("names", nargs="*", metavar="NAME", help="One or more repos (default: all)")
     p.add_argument("--fetch", action="store_true", help="Fetch before comparing remote")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("pin", help="Pin catalog to current HEAD")
-    p.add_argument("name", nargs="?", help="Single repo")
+    p.add_argument("names", nargs="*", metavar="NAME", help="One or more repos (default: all)")
     p.add_argument(
         "--here",
         action="store_true",
@@ -3053,7 +3115,7 @@ def build_parser() -> argparse.ArgumentParser:
         "hook-sync",
         help="Install git hooks that run pin --here after commit/pull/rebase/checkout",
     )
-    p.add_argument("name", nargs="?", help="Single repo")
+    p.add_argument("names", nargs="*", metavar="NAME", help="One or more repos (default: all)")
     p.add_argument(
         "--force",
         action="store_true",
@@ -3062,18 +3124,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_hook_sync)
 
     p = sub.add_parser("install", help="Clone missing repos and run install hooks")
-    p.add_argument("name", nargs="?", help="Single repo")
+    p.add_argument("names", nargs="*", metavar="NAME", help="One or more repos (default: all)")
     p.set_defaults(func=cmd_install)
 
     p = sub.add_parser("update", help="Fetch and fast-forward clean repos")
-    p.add_argument("name", nargs="?", help="Single repo")
+    p.add_argument("names", nargs="*", metavar="NAME", help="One or more repos (default: all)")
     p.set_defaults(func=cmd_update)
 
     p = sub.add_parser(
         "consolidate",
         help="Fetch and merge/rebase when update would fail; resolve conflicts stepwise",
     )
-    p.add_argument("name", nargs="?", help="Single repo")
+    p.add_argument("names", nargs="*", metavar="NAME", help="One or more repos (default: all)")
     p.add_argument(
         "--rebase",
         action="store_true",
@@ -3093,7 +3155,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_consolidate)
 
     p = sub.add_parser("push", help="Push tracking branch")
-    p.add_argument("name", nargs="?", help="Single repo")
+    p.add_argument("names", nargs="*", metavar="NAME", help="One or more repos (default: all)")
     p.set_defaults(func=cmd_push)
 
     p = sub.add_parser("export", help="Write origins.lock and VAND.md")
