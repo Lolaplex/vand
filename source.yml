@@ -1,0 +1,7 @@
+# Machine-readable quotient manifest for vand.
+version: 1
+install:
+  - python -m pip install -e .
+  - vand install-skills
+update: python -m pip install -e .
+verify: python -m unittest discover -s tests -v
