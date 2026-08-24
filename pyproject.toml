@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vand"
-version = "1.0.0"
+version = "1.0.1"
 description = "Materialize and pin source instances; origins.lock provenance and source.yml manifests."
 readme = "README.md"
 requires-python = ">=3.9"

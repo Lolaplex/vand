@@ -18,7 +18,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 CATALOG_VERSION = 1
 LOCK_VERSION = 1
