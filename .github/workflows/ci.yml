@@ -2,20 +2,27 @@ name: CI
 
 on:
   push:
-    branches: [main, "feat/*"]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
   workflow_dispatch:
+  release:
+    types: [published]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     name: Test (${{ matrix.os }} - Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        os: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'release' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && fromJSON('["ubuntu-latest","windows-latest","macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
+        python-version: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'release' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && fromJSON('["3.10","3.13"]') || fromJSON('["3.12"]') }}
 
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +39,7 @@ jobs:
           pip install -e .
 
       - name: Run tests
+        timeout-minutes: 10
         run: |
           python -m unittest discover -s tests -v
 
@@ -44,6 +52,32 @@ jobs:
         run: |
           python -m build
 
-      - name: Validate distribution
+      - name: Validate distribution metadata
         run: |
           twine check dist/*
+
+  notify:
+    name: Discord
+    needs: [test]
+    if: ${{ failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Post failure to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "::warning::DISCORD_WEBHOOK_URL unset; skip Discord notify"
+            exit 0
+          fi
+          PAYLOAD=$(python3 -c "import json, os; print(json.dumps({'content': f\"**{os.environ['GITHUB_REPOSITORY']}** \`{os.environ['GITHUB_WORKFLOW']}\` failed on \`{os.environ['GITHUB_REF_NAME']}\`\n{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}\"}))")
+          HTTP=$(curl -sS -o /tmp/discord-ci-body.txt -w "%{http_code}" \
+            -X POST -H "Content-Type: application/json" \
+            --data-binary "$PAYLOAD" "$DISCORD_WEBHOOK_URL")
+          if [ "$HTTP" = "204" ] || [ "$HTTP" = "200" ]; then
+            echo "Discord notified (HTTP $HTTP)"
+          else
+            echo "::warning::Discord webhook HTTP ${HTTP}: $(tr -d '\0' < /tmp/discord-ci-body.txt | head -c 500)"
+            exit 1
+          fi

@@ -258,19 +258,21 @@ See [`source.schema.json`](source.schema.json) for the JSON shape.
 | `scan` | Git folders under root not in catalog |
 | `add owner/repo [--install CMD]` | Clone + register |
 | `adopt FOLDER [--install CMD]` | Register existing clone (auto-reads manifest; runs `hook-sync`) |
-| `sync-hooks [NAME]` | Refresh catalog **install/update commands** from repo manifests (not git hooks) |
+
+Most commands take one or more repo names inline: `vand update agents-docs agents-memory vand`. With no names they apply to the whole catalog.
+| `sync-hooks [NAME...]` | Refresh catalog **install/update commands** from repo manifests (not git hooks) |
 | `rm NAME` | Remove from catalog (keeps folder; same as `deinstall --keep`) |
 | `deinstall NAME [--keep]` | Remove from catalog; default purges target directory |
-| `status [NAME] [--fetch]` | pinned / behind / ahead / dirty / diverged / missing |
-| `update [NAME]` | Fetch; ff-only if clean |
-| `consolidate [NAME] [--rebase]` | Merge/rebase when update cannot ff-only |
-| `consolidate --continue [NAME]` | Finish merge/rebase after fixing conflicts |
-| `consolidate --abort [NAME]` | Abort in-progress merge/rebase |
-| `push [NAME]` | Push branch |
-| `pin [NAME] [--export]` | Pin named repo (or all) to HEAD |
+| `status [NAME...] [--fetch]` | pinned / behind / ahead / dirty / diverged / missing |
+| `update [NAME...]` | Fetch; ff-only if clean |
+| `consolidate [NAME...] [--rebase]` | Merge/rebase when update cannot ff-only; rebase refused when it would rewrite local history across upstream commits |
+| `consolidate --continue [NAME...]` | Finish merge/rebase after fixing conflicts |
+| `consolidate --abort [NAME...]` | Abort in-progress merge/rebase |
+| `push [NAME...]` | Push branch; refuses when diverged from origin (reconcile with consolidate first) |
+| `pin [NAME...] [--export]` | Pin named repo (or all) to HEAD |
 | `pin --here [--quiet]` | Pin catalog row for cwd; `--quiet` for git hooks (logs on failure) |
-| `hook-sync [NAME] [--force]` | Install **git** pin hooks in `.git/hooks/` |
-| `install [NAME]` | Clone missing + checkout pin + install hooks |
+| `hook-sync [NAME...] [--force]` | Install **git** pin hooks in `.git/hooks/` |
+| `install [NAME...]` | Clone missing + checkout pin + install hooks |
 | `export [--out PATH]` | Write origins.lock + VAND.md |
 | `replicate LOCK [--root PATH] [--dry-run]` | Bootstrap from ledger |
 | `verify [--lock PATH]` | Drift check + verify hooks |
