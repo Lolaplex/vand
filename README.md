@@ -199,7 +199,7 @@ Do not set global `core.hooksPath` (Git replaces per-repo hooks instead of chain
 | HTTPS / SSH | `https://gitlab.com/group/project.git`, `git@host:org/repo.git` |
 | Local path | a folder on disk, or `file://` URL |
 
-`adopt` reads `origin` (push target). Extra remotes are stored as `mirrors` only if they **already contain the pinned SHA**. `origins.lock` stores source origin + pinned revision + target. Catalog may also cache hooks and git `mirrors` for fetch. Read aliases: `vendor.lock`, `vand.lock`, `shared.lock`. v1 locks are not loaded — re-export after upgrade.
+`adopt` reads `origin` (push target). Extra remotes are stored as `mirrors` only if they **already contain the pinned SHA**. `origins.lock` stores source origin + pinned revision + target. Catalog may also cache hooks and git `mirrors` for fetch. Read aliases: `vendor.lock`, `vand.lock`, `shared.lock`.
 
 **Pins are SHAs.** `Klix927/agent-memory` and `Lolaplex/agent-memory` are different remotes. They are fetch sources for a pin only when that exact commit exists there. `replicate` / `install` fetch `url` plus listed `mirrors` until the lock SHA is present, then check out that SHA. `update` / `push` still follow **origin**. A GitHub repo *name* match is not identity.
 
@@ -284,13 +284,13 @@ Most commands take one or more repo names inline: `vand update agents-docs agent
 
 Global: `--no-self-check` skips the 24h residual self-update. `--help-json` prints the CLI spec and exits.
 
-## origins.lock format (v2)
+## origins.lock format (version 1)
 
 Portable provenance only — no hooks, no branch. `target` is relative to the clone root you pass to `replicate`.
 
 ```json
 {
-  "version": 2,
+  "version": 1,
   "sources": [
     {
       "name": "example-app",
