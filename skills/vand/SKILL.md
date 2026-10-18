@@ -24,7 +24,7 @@ First install from this clone: `pip install -e .` then `vand init --root <clone-
 |------|------|
 | `~/.vand/catalog.json` | Curated source instances + clone root (private) |
 | `~/.vand/logs/` | Timestamped command logs (attempts, failures) |
-| `<clone-root>/origins.lock` | Shareable provenance ledger (v2) |
+| `<clone-root>/origins.lock` | Shareable provenance ledger (version 1) |
 | `<clone-root>/VAND.md` | Human table |
 | `<repo>/source.yml` | Quotient manifest: install/update/verify/deinstall shell commands |
 | `<clone>/.git/hooks/` | Git pin hooks from `hook-sync` (calls `pin --here --quiet`) |

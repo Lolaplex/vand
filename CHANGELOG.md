@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Source-agnostic core: `SourceRef`, `SourceInstance`, and `GitDriver` types replace the git-shaped catalog; Git is the first driver, not the ontology.
 - `source.yml` quotient manifest (protocol `version: 1`) mapping the fixed verb set `install` / `update` / `deinstall` plus optional `verify` to opaque shell commands (string or list, lists join with `&&`). Read aliases: `vand.yml/yaml/ini`, `vend.yml/yaml/ini`, JSON variants; canonical write is always `source.yml`.
-- `origins.lock` v2 provenance ledger at the clone root: origin + pinned revision + relative target only — no hooks, no branch, no per-machine state. Read aliases: `vendor.lock`, `vand.lock`, `shared.lock`. v1 locks are rejected, not migrated.
+- `origins.lock` provenance ledger (lock `version: 1`) at the clone root: origin + pinned revision + relative target only — no hooks, no branch, no per-machine state. Read aliases: `vendor.lock`, `vand.lock`, `shared.lock`. Pre-release lock formats are rejected, not migrated.
 - `vand deinstall NAME [--keep]`: removes the catalog entry and purges the target directory by default; runs an optional manifest `deinstall` hook first.
 - All-or-nothing ledger discipline: catalog pins and ledger exports only update after successful materialize/verify; failed attempts go to `~/.vand/logs/`.
 - `vand verify`: drift check against the ledger plus optional manifest `verify` hook.
