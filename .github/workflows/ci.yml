@@ -63,21 +63,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - name: Post failure to Discord
+      - name: Post error to CI webhook
         env:
+          CI_WEBHOOK_URL: ${{ secrets.CI_WEBHOOK_URL }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
-            echo "::warning::DISCORD_WEBHOOK_URL unset; skip Discord notify"
+          WEBHOOK_URL="${CI_WEBHOOK_URL:-$DISCORD_WEBHOOK_URL}"
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "::warning::CI_WEBHOOK_URL and DISCORD_WEBHOOK_URL unset; skip notification"
             exit 0
           fi
-          PAYLOAD=$(python3 -c "import json, os; print(json.dumps({'content': f\"**{os.environ['GITHUB_REPOSITORY']}** \`{os.environ['GITHUB_WORKFLOW']}\` failed on \`{os.environ['GITHUB_REF_NAME']}\`\n{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}\"}))")
-          HTTP=$(curl -sS -o /tmp/discord-ci-body.txt -w "%{http_code}" \
-            -X POST -H "Content-Type: application/json" \
-            --data-binary "$PAYLOAD" "$DISCORD_WEBHOOK_URL")
-          if [ "$HTTP" = "204" ] || [ "$HTTP" = "200" ]; then
-            echo "Discord notified (HTTP $HTTP)"
-          else
-            echo "::warning::Discord webhook HTTP ${HTTP}: $(tr -d '\0' < /tmp/discord-ci-body.txt | head -c 500)"
-            exit 1
-          fi
+          PAYLOAD=$(python3 -c "import json, os; repo=os.environ['GITHUB_REPOSITORY']; server=os.environ['GITHUB_SERVER_URL']; repo_url=f'{server}/{repo}'; ref=os.environ.get('GITHUB_HEAD_REF') or os.environ.get('GITHUB_REF_NAME'); run_url=f'{server}/{repo}/actions/runs/{os.environ[\"GITHUB_RUN_ID\"]}'; print(json.dumps({'embeds':[{'title':f'🔴 CI Failure: {repo}','url':run_url,'description':f\"Workflow **{os.environ['GITHUB_WORKFLOW']}** failed on \`{ref}\`\\n[View run]({run_url}) · [Repository]({repo_url})\",'color':15158332}]}))")
+          curl -fsS -X POST -H 'Content-Type: application/json' -d "$PAYLOAD" "$WEBHOOK_URL"
