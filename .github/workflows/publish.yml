@@ -31,3 +31,39 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+  notify-success:
+    name: Notify Release Success
+    needs: [publish]
+    if: ${{ success() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Post release success to webhook
+        env:
+          WEBHOOK_URL: ${{ secrets.RELEASE_WEBHOOK_URL }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "::warning::RELEASE_WEBHOOK_URL unset; skip notification"
+            exit 0
+          fi
+          PAYLOAD=$(python3 -c "import json, os; repo=os.environ['GITHUB_REPOSITORY']; server=os.environ['GITHUB_SERVER_URL']; repo_url=f'{server}/{repo}'; tag=os.environ['GITHUB_REF_NAME']; run_url=f'{server}/{repo}/actions/runs/{os.environ[\"GITHUB_RUN_ID\"]}'; release_url=f'{server}/{repo}/releases/tag/{tag}'; desc=f'[View run]({run_url}) · [Repository]({repo_url}) · [Release]({release_url})'; print(json.dumps({'embeds':[{'title':f'🚀 Release {tag} Published! — {repo}','url':release_url,'description':desc,'color':3066993}]}))")
+          curl -fsS -X POST -H 'Content-Type: application/json' -d "$PAYLOAD" "$WEBHOOK_URL"
+
+  notify-failure:
+    name: Notify Publish Failure
+    needs: [publish]
+    if: ${{ failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Post publish failure to CI webhook
+        env:
+          WEBHOOK_URL: ${{ secrets.CI_WEBHOOK_URL }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "::warning::CI_WEBHOOK_URL unset; skip notification"
+            exit 0
+          fi
+          PAYLOAD=$(python3 -c "import json, os; repo=os.environ['GITHUB_REPOSITORY']; server=os.environ['GITHUB_SERVER_URL']; repo_url=f'{server}/{repo}'; ref=os.environ['GITHUB_REF_NAME']; run_url=f'{server}/{repo}/actions/runs/{os.environ[\"GITHUB_RUN_ID\"]}'; print(json.dumps({'embeds':[{'title':f'🔴 Publish Failure: {repo}','url':run_url,'description':f\"Workflow **{os.environ['GITHUB_WORKFLOW']}** failed on \`{ref}\`\\n[View run]({run_url}) · [Repository]({repo_url})\",'color':15158332}]}))")
+          curl -fsS -X POST -H 'Content-Type: application/json' -d "$PAYLOAD" "$WEBHOOK_URL"
