@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI runs only on pull requests to `main`.
 - CI runs only on pull requests to `dev`/`main` and on manual dispatch, not on every branch push.
 
-### Removed
-- Automatic PyPI publishing from Actions, including manual `workflow_dispatch` uploads.
+### Added
+- Restored manual `workflow_dispatch` PyPI publish workflow with Discord success (`RELEASE_WEBHOOK_URL`) and failure (`CI_WEBHOOK_URL`) embed notifications.
 
 ## [1.0.1] - 2026-08-24
 
